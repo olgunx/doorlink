@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.map
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Dependencies
+dependencies.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+
+# CMake
+CMakeUserPresets.json
