@@ -1,0 +1,32 @@
+# Flutter/Dart build outputs
+doorlink_app/build/
+doorlink_app/.dart_tool/
+doorlink_app/.packages
+
+doorlink_app/.flutter-plugins
+
+doorlink_app/.flutter-plugins-dependencies
+
+doorlink_app/.idea/
+
+doorlink_app/.gradle/
+
+doorlink_app/android/.gradle/
+
+doorlink_app/android/local.properties
+
+# Android/Gradle wrapper binary artifacts
+**/gradle/wrapper/gradle-wrapper.jar
+
+# IDE files
+**/.idea/
+**/*.iml
+
+# Log files
+**/*.log
+
+# macOS files
+.DS_Store
+
+# Generated plugin registration
+doorlink_app/.dart_tool/flutter_build/

@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "ble-beacon-ci",
+			"path": "../ble-beacon-ci"
+		}
+	],
+	"settings": {}
+}
