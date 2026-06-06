@@ -9,6 +9,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "enrollment_mgr.h"
+#include "device_key.h"
 #include "cJSON.h"
 #include "nvs.h"
 
@@ -16,6 +17,11 @@ static const char *TAG = "web_console";
 static httpd_handle_t s_server = NULL;
 static uint32_t s_session_token = 0;
 static uint32_t s_session_expires = 0;
+
+size_t web_console_get_esp_public_key_hex(char *out, size_t out_size)
+{
+    return device_key_get_public_hex(out, out_size);
+}
 
 static int hex_char_to_int(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -139,6 +145,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     
     enrolled_device_t devs[ENROLLMENT_MAX_DEVICES];
     size_t count = enrollment_mgr_get_devices(devs, ENROLLMENT_MAX_DEVICES);
+    char esp_pub_hex[DEVICE_KEY_PUB_LEN * 2 + 1] = {0};
+    if (device_key_get_public_hex(esp_pub_hex, sizeof(esp_pub_hex)) == 0) {
+        snprintf(esp_pub_hex, sizeof(esp_pub_hex), "(unavailable)");
+    }
 
     char *html = malloc(4096);
     if (!html) {
@@ -150,13 +160,14 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                        "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>"
                        "<body style='font-family: Arial; padding: 20px;'>"
                        "<h2>Lighthouse Web Admin Trust Portal</h2>"
+                       "<p><b>ESP Public Key (hex, 65 bytes / 130 chars):</b><br><code style='word-break:break-all;'>%s</code></p>"
                        "<form action='/save' method='POST'>"
                        "<b>Device Fingerprint (User_ID Hex):</b><br>"
                        "<input type='text' name='fingerprint' maxlength='16' style='width:300px;'><br><br>"
-                       "<b>Initial Hash Seed:</b><br>"
-                       "<input type='text' name='seed' style='width:300px;'><br><br>"
+                       "<b>Phone Public Key (hex, 65 bytes / 130 chars):</b><br>"
+                       "<input type='text' name='pubkey' style='width:420px;'><br><br>"
                        "<input type='submit' value='Provision Target Device' style='padding: 10px 20px;'>"
-                       "</form><hr><h3>Registered Users</h3><ul>");
+                       "</form><hr><h3>Registered Users</h3><ul>", esp_pub_hex);
                        
     if (count == 0) {
         offset += snprintf(html + offset, 4096 - offset, "<li>No users registered.</li>");
@@ -228,31 +239,25 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     buf[ret] = '\0';
     
     char *fp_ptr = strstr(buf, "fingerprint=");
-    char *seed_ptr = strstr(buf, "seed=");
+    char *pubkey_ptr = strstr(buf, "pubkey=");
     
-    if (fp_ptr && seed_ptr) {
+    if (fp_ptr && pubkey_ptr) {
         fp_ptr += 12;
-        seed_ptr += 5;
+        pubkey_ptr += 7;
         
         char *fp_end = strchr(fp_ptr, '&');
         if (fp_end) *fp_end = '\0';
         
-        char *seed_end = strpbrk(seed_ptr, "&\r\n ");
-        if (seed_end) *seed_end = '\0';
+        char *pubkey_end = strpbrk(pubkey_ptr, "&\r\n ");
+        if (pubkey_end) *pubkey_end = '\0';
         
         uint8_t user_id[LIGHTHOUSE_USER_ID_LEN] = {0};
         hex2bin(fp_ptr, user_id, sizeof(user_id));
-        uint8_t dummy_pubkey[ENROLLMENT_PUBKEY_LEN] = {0};
-        
-        enrollment_mgr_add_device(user_id, dummy_pubkey);
-        
-        nvs_handle_t h;
-        if (nvs_open("lighthouse", NVS_READWRITE, &h) == ESP_OK) {
-            nvs_set_str(h, "seed", seed_ptr);
-            nvs_set_u32(h, "seq_idx", 0);
-            nvs_commit(h);
-            nvs_close(h);
+        uint8_t pubkey[ENROLLMENT_PUBKEY_LEN] = {0};
+        if (hex2bin(pubkey_ptr, pubkey, sizeof(pubkey)) == 0) {
+            enrollment_mgr_add_device(user_id, pubkey);
         }
+        
     }
     
     const char *html = "<html><body>Parameters Provisioned Securely. <a href='/status'>Go Back</a></body></html>";

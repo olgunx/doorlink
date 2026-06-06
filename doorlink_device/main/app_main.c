@@ -1,5 +1,6 @@
 #include "ble_scanner.h"
 #include "config.h"
+#include "device_key.h"
 #include "vl6180x.h"
 #include "enrollment_mgr.h"
 #include "web_console.h"
@@ -10,18 +11,27 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "mbedtls/md.h"
+#include "mbedtls/ecdh.h"
+#include "mbedtls/ecp.h"
+#include "mbedtls/bignum.h"
 #include "mbedtls/sha256.h"
 #include <string.h>
+#include <inttypes.h>
+#include <stdio.h>
 
 static const char *TAG = "lighthouse";
 static const char *NVS_NS = "lighthouse";
-static const uint32_t TOKEN_ROTATE_INTERVAL_MS = 10000;
+static const uint32_t TOKEN_ROTATE_INTERVAL_MS = 15000;
+static const uint32_t CLAIM_IDLE_TIMEOUT_MS = 20000;
 
 // LSB-first memory representation for NimBLE: 9f82c41d-3b7a-4291-a1e6-b5293d0cfa82
 static const uint8_t STATIC_UUID[16] = {0x82, 0xfa, 0x0c, 0x3d, 0x29, 0xb5, 0xe6, 0xa1, 0x91, 0x42, 0x7a, 0x3b, 0x1d, 0xc4, 0x82, 0x9f};
@@ -38,9 +48,14 @@ static volatile uint32_t s_claim_match_count;
 static volatile uint32_t s_last_mismatch_log_ms;
 static uint8_t s_last_user_id[LIGHTHOUSE_USER_ID_LEN];
 static uint8_t s_active_token[LIGHTHOUSE_TOKEN_LEN];
-
-static uint32_t s_current_sequence_index = 0;
-static char s_current_seed[64] = {0};
+static uint8_t s_previous_token[LIGHTHOUSE_TOKEN_LEN];
+static volatile uint32_t s_previous_token_valid_until_ms;
+static volatile uint32_t s_burn_cooldown_until_ms;
+static uint8_t s_active_challenge[LIGHTHOUSE_CHALLENGE_LEN];
+static uint8_t s_previous_challenge[LIGHTHOUSE_CHALLENGE_LEN];
+static volatile uint32_t s_previous_challenge_valid_until_ms;
+static bool s_enrolled_pubkey_logged;
+static bool s_device_pubkey_logged;
 
 static nvs_handle_t s_nvs = 0;
 static uint8_t s_vendor_ie_buf_a[sizeof(vendor_ie_data_t) + LIGHTHOUSE_TOKEN_LEN] __attribute__((aligned(4)));
@@ -48,6 +63,30 @@ static uint8_t s_vendor_ie_buf_b[sizeof(vendor_ie_data_t) + LIGHTHOUSE_TOKEN_LEN
 static uint8_t *s_vendor_ie_active = NULL;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
+static const char *bytes_to_hex(const uint8_t *bytes, size_t len, char *buf, size_t buf_size)
+{
+    if (bytes == NULL || buf == NULL || buf_size == 0) {
+        return "(null)";
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < len && offset + 2 < buf_size; ++i) {
+        offset += snprintf(buf + offset, buf_size - offset, "%02x", bytes[i]);
+    }
+    buf[offset] = '\0';
+    return buf;
+}
+static void format_uptime(char *buf, size_t buf_size, uint32_t ms)
+{
+    const uint32_t hours = ms / 3600000U;
+    const uint32_t minutes = (ms / 60000U) % 60U;
+    const uint32_t seconds = (ms / 1000U) % 60U;
+    const uint32_t millis = ms % 1000U;
+    snprintf(buf, buf_size, "%02u:%02u:%02u.%03u",
+             (unsigned int)hours,
+             (unsigned int)minutes,
+             (unsigned int)seconds,
+             (unsigned int)millis);
+}
 static void set_relay(bool on) { gpio_set_level(RELAY_GPIO, RELAY_ACTIVE_LOW ? !on : on); }
 
 static esp_err_t update_hidden_ap_token_ie(void)
@@ -69,13 +108,6 @@ static esp_err_t update_hidden_ap_token_ie(void)
     v->vendor_oui[2] = 0xF2;
     v->vendor_oui_type = 0x42;
     memcpy(v->payload, s_active_token, 6);
-    ESP_LOGI(TAG, "vendor IE update: eid=%02x len=%u tok0=%02x tok1=%02x tok2=%02x tok3=%02x",
-             (unsigned int)v->element_id,
-             (unsigned int)v->length,
-             (unsigned int)s_active_token[0],
-             (unsigned int)s_active_token[1],
-             (unsigned int)s_active_token[2],
-             (unsigned int)s_active_token[3]);
     esp_err_t err = esp_wifi_set_vendor_ie(true, WIFI_VND_IE_TYPE_BEACON, WIFI_VND_IE_ID_0, v);
     esp_err_t err2 = esp_wifi_set_vendor_ie(true, WIFI_VND_IE_TYPE_PROBE_RESP, WIFI_VND_IE_ID_0, v);
     if (err != ESP_OK || err2 != ESP_OK) {
@@ -88,34 +120,139 @@ static esp_err_t update_hidden_ap_token_ie(void)
 
 static void update_stealth_token(void)
 {
-    size_t len = sizeof(s_current_seed);
-    if (nvs_get_str(s_nvs, "seed", s_current_seed, &len) != ESP_OK || strlen(s_current_seed) == 0) {
-        return; // No seed provisioned yet
-    }
-    nvs_get_u32(s_nvs, "seq_idx", &s_current_sequence_index);
-
-    uint8_t hash[32] = {0};
-    for (uint32_t i = 0; i <= s_current_sequence_index; i++) {
-        if (i == 0) {
-            mbedtls_sha256((const unsigned char*)s_current_seed, strlen(s_current_seed), hash, 0);
-        } else {
-            mbedtls_sha256(hash, 32, hash, 0);
-        }
-    }
-
+    memcpy(s_previous_token, s_active_token, LIGHTHOUSE_TOKEN_LEN);
     memset(s_active_token, 0, LIGHTHOUSE_TOKEN_LEN);
-    memcpy(s_active_token, hash, (LIGHTHOUSE_TOKEN_LEN < 6) ? LIGHTHOUSE_TOKEN_LEN : 6);
+    for (size_t i = 0; i < LIGHTHOUSE_TOKEN_LEN; i++) {
+        s_active_token[i] = (uint8_t)esp_random();
+    }
+    s_previous_token_valid_until_ms = now_ms() + 10000;
+
+    memcpy(s_previous_challenge, s_active_challenge, LIGHTHOUSE_CHALLENGE_LEN);
+    for (size_t i = 0; i < LIGHTHOUSE_CHALLENGE_LEN; i += sizeof(uint32_t)) {
+        uint32_t rnd = esp_random();
+        size_t chunk = (LIGHTHOUSE_CHALLENGE_LEN - i) < sizeof(uint32_t) ? (LIGHTHOUSE_CHALLENGE_LEN - i) : sizeof(uint32_t);
+        memcpy(&s_active_challenge[i], &rnd, chunk);
+    }
+    s_previous_challenge_valid_until_ms = now_ms() + 5000;
 
     s_authorized = false;
     s_auth_window_started_ms = 0;
 
     esp_err_t err = update_hidden_ap_token_ie();
+    ble_scanner_set_challenge_beacon(s_active_challenge);
     if (err == ESP_ERR_NOT_SUPPORTED) {
         return;
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Stealth IE injection update failed");
     }
+}
+
+static int ecdh_rng_wrapper(void *ctx, unsigned char *buf, size_t len)
+{
+    (void)ctx;
+    esp_fill_random(buf, len);
+    return 0;
+}
+
+static bool compute_expected_response(const uint8_t *user_id, const uint8_t *challenge, const uint8_t *peer_pubkey, uint8_t out[LIGHTHOUSE_RESPONSE_LEN])
+{
+    if (user_id == NULL || challenge == NULL || peer_pubkey == NULL || out == NULL) {
+        return false;
+    }
+
+    uint8_t input[LIGHTHOUSE_USER_ID_LEN + LIGHTHOUSE_CHALLENGE_LEN];
+    memcpy(input, user_id, LIGHTHOUSE_USER_ID_LEN);
+    memcpy(input + LIGHTHOUSE_USER_ID_LEN, challenge, LIGHTHOUSE_CHALLENGE_LEN);
+
+    uint8_t shared_secret[32] = {0};
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_point peer_pub;
+    mbedtls_mpi priv;
+    mbedtls_mpi z;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_ecp_point_init(&peer_pub);
+    mbedtls_mpi_init(&priv);
+    mbedtls_mpi_init(&z);
+
+    int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "compute_expected_response: ecp_group_load failed ret=%d", ret);
+        mbedtls_ecp_group_free(&grp);
+        mbedtls_ecp_point_free(&peer_pub);
+        mbedtls_mpi_free(&priv);
+        mbedtls_mpi_free(&z);
+        return false;
+    }
+
+    const uint8_t *esp_private_key = device_key_get_private();
+    if (esp_private_key == NULL) {
+        ESP_LOGE(TAG, "compute_expected_response: ESP private key unavailable");
+        mbedtls_ecp_group_free(&grp);
+        mbedtls_ecp_point_free(&peer_pub);
+        mbedtls_mpi_free(&priv);
+        mbedtls_mpi_free(&z);
+        return false;
+    }
+
+    ret = mbedtls_mpi_read_binary(&priv, esp_private_key, DEVICE_KEY_PRIV_LEN);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "compute_expected_response: mpi_read_binary(private) failed ret=%d", ret);
+        mbedtls_ecp_group_free(&grp);
+        mbedtls_ecp_point_free(&peer_pub);
+        mbedtls_mpi_free(&priv);
+        mbedtls_mpi_free(&z);
+        return false;
+    }
+
+    ret = mbedtls_ecp_point_read_binary(&grp, &peer_pub, peer_pubkey, ENROLLMENT_PUBKEY_LEN);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "compute_expected_response: point_read_binary(peer_pubkey) failed ret=%d", ret);
+        mbedtls_ecp_group_free(&grp);
+        mbedtls_ecp_point_free(&peer_pub);
+        mbedtls_mpi_free(&priv);
+        mbedtls_mpi_free(&z);
+        return false;
+    }
+
+    ret = mbedtls_ecdh_compute_shared(&grp, &z, &peer_pub, &priv, ecdh_rng_wrapper, NULL);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "compute_expected_response: ecdh_compute_shared failed ret=%d", ret);
+        mbedtls_ecp_group_free(&grp);
+        mbedtls_ecp_point_free(&peer_pub);
+        mbedtls_mpi_free(&priv);
+        mbedtls_mpi_free(&z);
+        return false;
+    }
+
+    ret = mbedtls_mpi_write_binary(&z, shared_secret, sizeof(shared_secret));
+    if (ret != 0) {
+        ESP_LOGE(TAG, "compute_expected_response: mpi_write_binary(shared_secret) failed ret=%d", ret);
+        mbedtls_ecp_group_free(&grp);
+        mbedtls_ecp_point_free(&peer_pub);
+        mbedtls_mpi_free(&priv);
+        mbedtls_mpi_free(&z);
+        return false;
+    }
+
+    mbedtls_ecp_group_free(&grp);
+    mbedtls_ecp_point_free(&peer_pub);
+    mbedtls_mpi_free(&priv);
+    mbedtls_mpi_free(&z);
+
+    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md_info == NULL) {
+        return false;
+    }
+
+    uint8_t full_mac[32];
+    ret = mbedtls_md_hmac(md_info, shared_secret, sizeof(shared_secret), input, sizeof(input), full_mac);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "compute_expected_response: md_hmac failed ret=%d", ret);
+        return false;
+    }
+    memcpy(out, full_mac, LIGHTHOUSE_RESPONSE_LEN);
+    return true;
 }
 
 static void claim_detected(const lighthouse_ble_claim_t *claim)
@@ -128,12 +265,29 @@ static void claim_detected(const lighthouse_ble_claim_t *claim)
     s_last_claim_rssi = claim->rssi;
     s_arrived = claim->rssi >= BEACON_ARRIVED_RSSI_DBM;
     memcpy(s_last_user_id, claim->user_id, LIGHTHOUSE_USER_ID_LEN);
-    
-    if (!enrollment_mgr_is_device_active(claim->user_id, NULL)) {
-        return; // Ignore claims from unenrolled devices
+
+    uint8_t enrolled_pubkey[ENROLLMENT_PUBKEY_LEN] = {0};
+    if (!enrollment_mgr_is_device_active(claim->user_id, enrolled_pubkey)) {
+        return;
     }
-    
-    if (memcmp(claim->token, s_active_token, LIGHTHOUSE_TOKEN_LEN) == 0) {
+    if (!s_enrolled_pubkey_logged) {
+        s_enrolled_pubkey_logged = true;
+        char pubkey_hex[ENROLLMENT_PUBKEY_LEN * 2 + 1];
+        ESP_LOGI(TAG, "enrolled pubkey=%s",
+                 bytes_to_hex(enrolled_pubkey, ENROLLMENT_PUBKEY_LEN, pubkey_hex, sizeof(pubkey_hex)));
+    }
+
+    uint8_t expected_response[LIGHTHOUSE_RESPONSE_LEN] = {0};
+    const bool active_challenge_match = memcmp(claim->challenge, s_active_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
+    const bool previous_challenge_match = s_previous_challenge_valid_until_ms != 0 &&
+                                          now_ms() <= s_previous_challenge_valid_until_ms &&
+                                          memcmp(claim->challenge, s_previous_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
+    const bool response_ok = compute_expected_response(claim->user_id, claim->challenge, enrolled_pubkey, expected_response) &&
+                             memcmp(claim->response, expected_response, LIGHTHOUSE_RESPONSE_LEN) == 0;
+
+    if ((active_challenge_match || previous_challenge_match) &&
+        response_ok &&
+        now_ms() >= s_burn_cooldown_until_ms) {
         s_claim_match_count++;
         s_authorized = true;
         s_auth_window_started_ms = now_ms();
@@ -141,15 +295,6 @@ static void claim_detected(const lighthouse_ble_claim_t *claim)
         const uint32_t now = now_ms();
         if (s_last_mismatch_log_ms == 0 || (now - s_last_mismatch_log_ms) >= 2000) {
             s_last_mismatch_log_ms = now;
-            ESP_LOGI(TAG, "claim mismatch claim=%02x%02x%02x%02x active=%02x%02x%02x%02x",
-                     (unsigned int)claim->token[0],
-                     (unsigned int)claim->token[1],
-                     (unsigned int)claim->token[2],
-                     (unsigned int)claim->token[3],
-                     (unsigned int)s_active_token[0],
-                     (unsigned int)s_active_token[1],
-                     (unsigned int)s_active_token[2],
-                     (unsigned int)s_active_token[3]);
         }
     }
 }
@@ -162,13 +307,15 @@ static void status_task(void *arg)
     bool prev_arrived = false;
     bool prev_laser = false;
     bool prev_relay = false;
-    uint32_t prev_rx = UINT32_MAX;
-    uint32_t prev_match = UINT32_MAX;
-    uint32_t last_log_ms = 0;
     while (true) {
         const uint32_t now = now_ms();
         const uint32_t last_claim_age_ms = s_last_claim_ms == 0 ? 0 : (now - s_last_claim_ms);
-        const bool comm = s_last_claim_ms != 0 && last_claim_age_ms <= 10000;
+
+        if (s_last_claim_ms != 0 && last_claim_age_ms > CLAIM_IDLE_TIMEOUT_MS) {
+            s_arrived = false; // Reset arrived status if app goes out of range
+        }
+
+        const bool comm = s_last_claim_ms != 0 && last_claim_age_ms <= CLAIM_IDLE_TIMEOUT_MS;
         const bool auth = s_authorized;
         const bool arrived = s_arrived;
         const bool laser = s_laser_detected;
@@ -176,17 +323,18 @@ static void status_task(void *arg)
         const uint32_t rx = s_claim_rx_count;
         const uint32_t match = s_claim_match_count;
         const bool changed = comm != prev_comm || auth != prev_auth || arrived != prev_arrived || laser != prev_laser ||
-                             relay != prev_relay ||
-                             rx != prev_rx || match != prev_match;
-        const bool heartbeat = (now - last_log_ms) >= 10000;
+                             relay != prev_relay;
 
-        if (changed || heartbeat) {
-            ESP_LOGI(TAG, "APP=%s AUTH=%s ARRIVED=%s LASER=%s RELAY=%s RX=%u MATCH=%u",
-                     comm ? "OK" : "LOST",
-                     auth ? "Y" : "N",
-                     arrived ? "Y" : "N",
-                     laser ? "Y" : "N",
-                     relay ? "ON" : "OFF",
+        if (changed) {
+            char ts[16];
+            format_uptime(ts, sizeof(ts), now);
+            ESP_LOGI(TAG, "[%s] APP [%s] -> AUTH [%s] -> ARRIVED [%s] -> LASER [%s] -> RELAY [%s] (RX=%u MATCH=%u)",
+                     ts,
+                     comm ? "X" : " ",
+                     auth ? "X" : " ",
+                     arrived ? "X" : " ",
+                     laser ? "X" : " ",
+                     relay ? "X" : " ",
                      (unsigned int)rx,
                      (unsigned int)match);
             prev_comm = comm;
@@ -194,9 +342,6 @@ static void status_task(void *arg)
             prev_arrived = arrived;
             prev_laser = laser;
             prev_relay = relay;
-            prev_rx = rx;
-            prev_match = match;
-            last_log_ms = now;
         }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
@@ -267,14 +412,17 @@ static void sensor_task(void *arg)
 
         if (s_authorized && s_arrived && s_laser_detected) {
             s_relay_active_until_ms = now_ms() + RELAY_TRIGGER_MS;
-            
-            // Instant Burn: Fast-forward chain index
-            s_current_sequence_index++;
-            nvs_set_u32(s_nvs, "seq_idx", s_current_sequence_index);
-            nvs_commit(s_nvs);
+
             update_stealth_token(); // Roll immediately
-            
+            s_burn_cooldown_until_ms = now_ms() + 2500;
+            s_previous_token_valid_until_ms = 0;
+            s_previous_challenge_valid_until_ms = 0;
+
             s_authorized = false;
+            s_last_claim_ms = 0; // require a fresh claim/token exchange after burn
+            char ts[16];
+            format_uptime(ts, sizeof(ts), now_ms());
+            ESP_LOGI(TAG, "[%s] challenge burned; waiting for new claim", ts);
         }
         vTaskDelay(pdMS_TO_TICKS(VL6180X_POLL_MS));
     }
@@ -315,6 +463,16 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     ESP_ERROR_CHECK(nvs_open(NVS_NS, NVS_READWRITE, &s_nvs));
+    ESP_ERROR_CHECK(device_key_init());
+    if (!s_device_pubkey_logged) {
+        s_device_pubkey_logged = true;
+        const uint8_t *device_pubkey = device_key_get_public();
+        if (device_pubkey != NULL) {
+            char pubkey_hex[DEVICE_KEY_PUB_LEN * 2 + 1];
+            ESP_LOGI(TAG, "device pubkey=%s",
+                     bytes_to_hex(device_pubkey, DEVICE_KEY_PUB_LEN, pubkey_hex, sizeof(pubkey_hex)));
+        }
+    }
     ESP_ERROR_CHECK(enrollment_mgr_init());
 
     gpio_reset_pin(RELAY_GPIO);
@@ -323,7 +481,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(init_vl6180x_bus());
     ESP_ERROR_CHECK(init_wifi_hidden_ap());
-    update_stealth_token(); // Load NVS Seed & Init Token (requires Wi-Fi to be initialized first)
+    update_stealth_token(); // Initialize the current challenge beacon
     ESP_ERROR_CHECK(web_console_init());
     ESP_ERROR_CHECK(ble_scanner_set_static_uuid_beacon(STATIC_UUID));
     ble_scanner_set_claim_detected_cb(claim_detected);

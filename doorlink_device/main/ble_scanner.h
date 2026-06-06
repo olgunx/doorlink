@@ -7,12 +7,15 @@
 extern "C" {
 #endif
 
-#define LIGHTHOUSE_USER_ID_LEN 4
-#define LIGHTHOUSE_TOKEN_LEN   16
+#define LIGHTHOUSE_USER_ID_LEN      4
+#define LIGHTHOUSE_CHALLENGE_LEN     8
+#define LIGHTHOUSE_RESPONSE_LEN     15
+#define LIGHTHOUSE_TOKEN_LEN         16
 
 typedef struct {
     uint8_t user_id[LIGHTHOUSE_USER_ID_LEN];
-    uint8_t token[LIGHTHOUSE_TOKEN_LEN];
+    uint8_t challenge[LIGHTHOUSE_CHALLENGE_LEN];
+    uint8_t response[LIGHTHOUSE_RESPONSE_LEN];
     int rssi;
 } lighthouse_ble_claim_t;
 
@@ -20,6 +23,7 @@ typedef void (*lighthouse_claim_detected_cb_t)(const lighthouse_ble_claim_t *cla
 
 void ble_scanner_set_claim_detected_cb(lighthouse_claim_detected_cb_t cb);
 esp_err_t ble_scanner_set_static_uuid_beacon(const uint8_t *uuid_16_bytes);
+esp_err_t ble_scanner_set_challenge_beacon(const uint8_t *challenge_8_bytes);
 esp_err_t ble_scanner_init(void);
 
 #ifdef __cplusplus

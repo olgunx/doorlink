@@ -1,8 +1,9 @@
 import 'dart:async';
+import 'dart:math';
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:share_plus/share_plus.dart';
 
 void main() {
@@ -36,23 +37,29 @@ class _MainAppScreenState extends State<MainAppScreen> {
   // UI State
   int _currentIndex = 0;
   bool _isActive = false;
-  String _userId = "4aa4eee6";
-  String _hashSeed = "516142cd42f0e5e7";
+  String _userId = "";
+  String _appPublicKey = "";
   late TextEditingController _userIdController;
-  late TextEditingController _seedController;
+  late TextEditingController _pubKeyController;
 
   // Engine State
   String _status = 'Initializing...';
-  StreamSubscription<List<ScanResult>>? _scanSubscription;
-  bool _isMirroring = false;
-  int _devicesFound = 0;
-  final Set<String> _seenUuids = {};
   final List<String> _logs = [];
 
+  String _formatTimestamp(DateTime time) {
+    final local = time.toLocal();
+    final hours = local.hour.toString().padLeft(2, '0');
+    final minutes = local.minute.toString().padLeft(2, '0');
+    final seconds = local.second.toString().padLeft(2, '0');
+    final milliseconds = local.millisecond.toString().padLeft(3, '0');
+    return '$hours:$minutes:$seconds.$milliseconds';
+  }
+
   void _addLog(String msg) {
-    print("DEBUG: $msg");
+    final timestamp = _formatTimestamp(DateTime.now());
+    print("[$timestamp] DEBUG: $msg");
     setState(() {
-      _logs.insert(0, "${DateTime.now().toIso8601String().substring(11, 19)}: $msg");
+      _logs.insert(0, "[$timestamp] $msg");
       if (_logs.length > 50) _logs.removeLast();
     });
   }
@@ -61,15 +68,75 @@ class _MainAppScreenState extends State<MainAppScreen> {
   void initState() {
     super.initState();
     _userIdController = TextEditingController(text: _userId);
-    _seedController = TextEditingController(text: _hashSeed);
-    _status = 'Idle';
+    _pubKeyController = TextEditingController(text: _appPublicKey);
+    _status = 'Loading credentials...';
+    platform.setMethodCallHandler(_handleNativeCall);
+    _loadOrCreateCredentials();
+  }
+
+  Future<void> _handleNativeCall(MethodCall call) async {
+    if (call.method == 'onNativeDebug') {
+      final message = call.arguments?.toString() ?? '';
+      if (message.isNotEmpty) {
+        _addLog(message);
+        if (message.contains('scan started')) {
+          setState(() => _status = 'Waiting for Beacon...');
+        } else if (message.contains('Response advertising started')) {
+          setState(() => _status = 'Broadcasting BLE...');
+        } else if (message.contains('Missing BLE scan permissions')) {
+          _addLog('Native service says BLE permissions are missing');
+        } else if (message.contains('Missing credentials')) {
+          _addLog('Native service did not receive a userId');
+        } else if (message.contains('Stop requested')) {
+          _addLog('Native service stop requested');
+        }
+      }
+    }
+  }
+
+  String _randomHex(int byteCount) {
+    final random = Random.secure();
+    final bytes = List<int>.generate(byteCount, (_) => random.nextInt(256));
+    return bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  Future<void> _loadOrCreateCredentials() async {
+    try {
+      final stored = await platform.invokeMethod<Map<dynamic, dynamic>>('getStoredCredentials');
+      final storedUserId = stored?['userId']?.toString().trim() ?? '';
+      final appPubKey = await platform.invokeMethod<String>('getAppPublicKey') ?? '';
+      _addLog('Loaded creds: userId=${storedUserId.isNotEmpty ? storedUserId : "(new)"} pubKeyLen=${appPubKey.length}');
+
+      final nextUserId = storedUserId.isNotEmpty ? storedUserId : _randomHex(4);
+
+      if (storedUserId.isEmpty) {
+        await platform.invokeMethod('saveStoredCredentials', {
+          'userId': nextUserId,
+        });
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _userId = nextUserId;
+        _appPublicKey = appPubKey;
+        _userIdController.text = nextUserId;
+        _pubKeyController.text = appPubKey;
+        _status = appPubKey.isNotEmpty ? 'Credentials ready' : 'Credentials unavailable yet';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Credential load error';
+      });
+      _addLog('Credential load error: $e');
+    }
   }
 
   @override
   void dispose() {
-    _scanSubscription?.cancel();
+    platform.setMethodCallHandler(null);
     _userIdController.dispose();
-    _seedController.dispose();
+    _pubKeyController.dispose();
     super.dispose();
   }
 
@@ -86,117 +153,105 @@ class _MainAppScreenState extends State<MainAppScreen> {
   }
 
   Future<void> _stopListening() async {
-    _scanSubscription?.cancel();
-    await FlutterBluePlus.stopScan();
+    try {
+      _addLog('Requesting foreground service stop');
+      await platform.invokeMethod('stopBackgroundService');
+    } catch (_) {}
     setState(() {
       _status = 'Service Stopped';
-      _isMirroring = false;
       _addLog("Service stopped.");
     });
   }
 
   Future<void> _initListening() async {
-    // Request all necessary system hardware permissions
-    await [
-      Permission.location,
+    final sdkInt = await _getAndroidSdkInt();
+
+    final permissionsToRequest = <Permission>[
       Permission.bluetooth,
       Permission.bluetoothAdvertise,
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
-      Permission.nearbyWifiDevices,
-    ].request();
+      Permission.notification,
+    ];
+    if (!Platform.isAndroid || sdkInt < 31) {
+      permissionsToRequest.add(Permission.location);
+    }
 
-    // Wait to ensure the phone's Bluetooth is physically turned ON
-    await FlutterBluePlus.adapterState.where((val) => val == BluetoothAdapterState.on).first;
+    // Request all necessary system hardware permissions
+    Map<Permission, PermissionStatus> statuses = await permissionsToRequest.request();
+    _addLog("Permission results: ${statuses.entries.map((e) => '${e.key.toString().split('.').last}=${e.value.isGranted ? 'granted' : 'denied'}').join(', ')}");
+
+    List<String> deniedPerms = [];
+    statuses.forEach((perm, status) {
+      if (!status.isGranted) {
+        deniedPerms.add(perm.toString().split('.').last);
+      }
+    });
+
+    if (deniedPerms.isNotEmpty) {
+      setState(() => _status = 'Permission Denied! Check AndroidManifest.xml');
+      _addLog("Error: Denied: ${deniedPerms.join(', ')}");
+      return;
+    }
 
     if (!mounted || !_isActive) return;
 
     setState(() {
-      _status = 'Listening for Beacon...';
-      _addLog("Started BLE Scan...");
+      _status = 'Starting background service...';
+      _addLog("SC[X]BG[ ]CH[ ]AD[ ]OK[ ]");
     });
-
-    // The specific UUID broadcasted by ESP32 (ble_scanner.c)
-    final String targetUuid = "9f82c41d-3b7a-4291-a1e6-b5293d0cfa82";
-    _seenUuids.clear();
-
-    _scanSubscription?.cancel();
-    _scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
-      if (!_isActive) return;
-
-      setState(() {
-        _devicesFound = results.length; // Visually confirm the scanner is alive
-      });
-
-      for (ScanResult r in results) {
-        // Log any newly discovered Service UUIDs to the screen
-        for (var u in r.advertisementData.serviceUuids) {
-          String uuidStr = u.toString().toLowerCase();
-          if (!_seenUuids.contains(uuidStr)) {
-            _seenUuids.add(uuidStr);
-            _addLog("Service UUID: $uuidStr");
-          }
-        }
-        
-        // Also log Service Data UUIDs just in case Android categorizes it here
-        for (var u in r.advertisementData.serviceData.keys) {
-          String uuidStr = u.toString().toLowerCase();
-          if (!_seenUuids.contains("data_$uuidStr")) {
-            _seenUuids.add("data_$uuidStr");
-            _addLog("ServiceData UUID: $uuidStr");
-          }
-        }
-
-        // String comparison bypasses Guid object reference/case-sensitivity issues
-        bool match = r.advertisementData.serviceUuids.any((uuid) => uuid.toString().toLowerCase() == targetUuid);
-        if (!match) {
-          match = r.advertisementData.serviceData.keys.any((uuid) => uuid.toString().toLowerCase() == targetUuid);
-        }
-        
-        if (match && !_isMirroring) {
-          _isMirroring = true;
-          _addLog("MATCH! Target UUID found.");
-          FlutterBluePlus.stopScan();
-          _startMirroring();
-        }
-      }
-    });
-
-    // Scanning without 'withServices' to capture all BLE devices in range
-    await FlutterBluePlus.startScan(continuousUpdates: true);
-  }
-
-  Future<void> _startMirroring() async {
-    setState(() {
-      _status = 'Wakeup Beacon detected! Extracting token...';
-    });
+    _addLog('Starting foreground service with userId=$_userId pubKeyLen=${_appPublicKey.length}');
+    final batteryIgnored = await _isIgnoringBatteryOptimizations();
+    _addLog('Battery optimization ignored=${batteryIgnored ? "yes" : "no"}');
 
     try {
-      final String statusStr = await platform.invokeMethod('startMirroring', {'userId': _userId});
-      if (!mounted) return;
-
+      await platform.invokeMethod('saveStoredCredentials', {
+        'userId': _userId,
+      });
+      await platform.invokeMethod('startBackgroundService', {
+        'userId': _userId,
+      });
+      if (!mounted || !_isActive) return;
       setState(() {
-        if (statusStr == 'SUCCESS') {
-          _status = 'Broadcasting BLE...';
-          _addLog("BLE Mirror Broadcast Active");
-        } else {
-          _status = 'Failed: $statusStr';
-          _addLog("Mirror Error: $statusStr");
-        }
+        _status = 'Waiting for Beacon...';
+        _addLog("SC[X]BG[X]CH[ ]AD[ ]OK[ ]");
       });
-
-      // Automatically restart listening after 10 seconds to allow for continuous use
-      Future.delayed(const Duration(seconds: 10), () {
-        if (_isActive && mounted) {
-          _isMirroring = false;
-          _initListening();
-        }
-      });
+      _addLog('Foreground service start requested successfully');
     } on PlatformException catch (e) {
       if (!mounted) return;
       setState(() {
         _status = "Error: '${e.message}'";
       });
+      _addLog("Background start failed: ${e.message ?? 'unknown'}");
+    }
+  }
+
+  Future<int> _getAndroidSdkInt() async {
+    if (!Platform.isAndroid) return 0;
+    try {
+      final value = await platform.invokeMethod<int>('getAndroidSdkInt');
+      return value ?? 0;
+    } on PlatformException {
+      return 0;
+    }
+  }
+
+  Future<void> _openBatteryOptimizationSettings() async {
+    try {
+      await platform.invokeMethod('openBatteryOptimizationSettings');
+      _addLog('Opened battery optimization settings');
+    } catch (e) {
+      _addLog('Failed to open battery settings: $e');
+    }
+  }
+
+  Future<bool> _isIgnoringBatteryOptimizations() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final value = await platform.invokeMethod<bool>('isIgnoringBatteryOptimizations');
+      return value ?? false;
+    } on PlatformException {
+      return false;
     }
   }
 
@@ -222,7 +277,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
             title: const Text('Enable Auto-Unlock', style: TextStyle(fontWeight: FontWeight.bold)),
             subtitle: const Text('Listen for door beacon in background'),
             value: _isActive,
-            activeColor: Colors.green,
+            activeThumbColor: Colors.green,
             onChanged: _toggleService,
           ),
         ],
@@ -236,7 +291,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('BLE devices seen in range: $_devicesFound', style: const TextStyle(fontSize: 16)),
+          Text('Native log entries: ${_logs.length}', style: const TextStyle(fontSize: 16)),
           const SizedBox(height: 10),
           const Text('Raw Event Logs:', style: TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 10),
@@ -270,10 +325,11 @@ class _MainAppScreenState extends State<MainAppScreen> {
           const SizedBox(height: 20),
           TextField(
             controller: _userIdController,
+            readOnly: true,
             decoration: const InputDecoration(
               labelText: 'Device Fingerprint (User ID)',
               border: OutlineInputBorder(),
-              helperText: 'Must match the 8-character hex ID in the Web Console.',
+              helperText: 'Generated per phone; keep it unique.',
             ),
             onChanged: (val) {
               _userId = val;
@@ -281,23 +337,46 @@ class _MainAppScreenState extends State<MainAppScreen> {
           ),
         const SizedBox(height: 20),
           TextField(
-            controller: _seedController,
+            controller: _pubKeyController,
+            readOnly: true,
             decoration: const InputDecoration(
-              labelText: 'Initial Hash Seed',
+              labelText: 'App Public Key',
               border: OutlineInputBorder(),
-              helperText: 'Must match the seed in the Web Console.',
+              helperText: 'Share this with the admin via messaging; it is public.',
             ),
             onChanged: (val) {
-              _hashSeed = val;
+              _appPublicKey = val;
             },
           ),
         const SizedBox(height: 20),
         SizedBox(
           width: double.infinity,
-          child: ElevatedButton.icon(
+          child: OutlinedButton.icon(
+            onPressed: _loadOrCreateCredentials,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Refresh Credentials'),
+          ),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _openBatteryOptimizationSettings,
+            icon: const Icon(Icons.battery_alert_outlined),
+            label: const Text('Open Battery Settings'),
+          ),
+        ),
+        const SizedBox(height: 20),
+        SizedBox(
+          width: double.infinity,
+            child: ElevatedButton.icon(
             onPressed: () {
-              if (_userId.isNotEmpty && _hashSeed.isNotEmpty) {
-                Share.share('Hello Admin, here is my DoorLink provisioning data to grant me access:\n\nFingerprint (User ID): $_userId\nInitial Hash Seed: $_hashSeed');
+              if (_userId.isNotEmpty && _appPublicKey.isNotEmpty) {
+                SharePlus.instance.share(
+                  ShareParams(
+                    text: 'Hello Admin, here is my DoorLink provisioning data to grant me access:\n\nFingerprint (User ID): $_userId\nApp Public Key (raw hex): $_appPublicKey',
+                  ),
+                );
               }
             },
             icon: const Icon(Icons.share),

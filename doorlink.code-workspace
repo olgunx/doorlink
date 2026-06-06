@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "doorlink_device",
+			"path": "doorlink_device"
+		}
+	],
+	"settings": {
+		"idf.currentSetup": "/home/olgun/esp/v5.5.1/esp-idf",
+		"idf.flashType": "UART",
+		"idf.port": "/dev/ttyACM0"
+	}
+}

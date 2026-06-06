@@ -1,114 +1,153 @@
 package com.example.doorlink
 
-import android.Manifest
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
+import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
+import android.util.Base64
 import androidx.annotation.NonNull
-import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.security.KeyFactory
+import java.security.KeyPair
+import java.security.KeyPairGenerator
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
 
-class MainActivity: FlutterActivity() {
-    private val CHANNEL = "com.example.blebeacon/lighthouse"
-    private var advertiser = BluetoothAdapter.getDefaultAdapter()?.bluetoothLeAdvertiser
+class MainActivity : FlutterActivity() {
+    private val channelName = "com.example.blebeacon/lighthouse"
+    private lateinit var methodChannel: MethodChannel
+
+    private val debugReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val message = intent?.getStringExtra(BeaconService.EXTRA_DEBUG_MESSAGE).orEmpty()
+            if (message.isNotBlank()) {
+                methodChannel.invokeMethod("onNativeDebug", message)
+            }
+        }
+    }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            if (call.method == "startMirroring") {
-                val userIdHex = call.argument<String>("userId") ?: ""
-                val status = runLighthouseMirror(userIdHex)
-                result.success(status)
-            } else {
-                result.notImplemented()
+        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+        methodChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getAppPublicKey" -> {
+                    try {
+                        result.success(EcKeyEncoding.publicKeyHex(AppKeyMaterial.getOrCreate(this)))
+                    } catch (e: Exception) {
+                        result.error("ERR_KEYPAIR", e.message, null)
+                    }
+                }
+                "getStoredCredentials" -> {
+                    val prefs = getSharedPreferences("doorlink_credentials", Context.MODE_PRIVATE)
+                    val userId = prefs.getString("user_id", "") ?: ""
+                    result.success(mapOf("userId" to userId))
+                }
+                "saveStoredCredentials" -> {
+                    val userId = call.argument<String>("userId")?.trim().orEmpty()
+                    if (userId.isBlank()) {
+                        result.error("ERR_BAD_ARGS", "Missing userId", null)
+                        return@setMethodCallHandler
+                    }
+                    getSharedPreferences("doorlink_credentials", Context.MODE_PRIVATE)
+                        .edit()
+                        .putString("user_id", userId)
+                        .apply()
+                    result.success("OK")
+                }
+                "startBackgroundService" -> {
+                    val userId = call.argument<String>("userId")?.trim().orEmpty()
+                    if (userId.isBlank()) {
+                        result.error("ERR_BAD_ARGS", "Missing userId", null)
+                        return@setMethodCallHandler
+                    }
+
+                    val intent = Intent(this, BeaconService::class.java).apply {
+                        putExtra(BeaconService.EXTRA_USER_ID, userId)
+                    }
+                    ContextCompat.startForegroundService(this, intent)
+                    result.success("OK")
+                }
+
+                "stopBackgroundService" -> {
+                    val intent = Intent(this, BeaconService::class.java).apply {
+                        action = BeaconService.ACTION_STOP
+                    }
+                    startService(intent)
+                    result.success("OK")
+                }
+
+                "getAndroidSdkInt" -> result.success(Build.VERSION.SDK_INT)
+                "isIgnoringBatteryOptimizations" -> {
+                    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                    result.success(powerManager.isIgnoringBatteryOptimizations(packageName))
+                }
+                "openBatteryOptimizationSettings" -> {
+                    val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                    result.success("OK")
+                }
+                else -> result.notImplemented()
             }
         }
     }
 
-    private fun runLighthouseMirror(userIdHex: String): String {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return "ERR_OS_TOO_OLD"
-
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            return "ERR_NO_LOCATION_PERM"
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter(BeaconService.ACTION_DEBUG_STATUS)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(debugReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(debugReceiver, filter)
         }
+    }
 
-        // 1. Scan Wi-Fi for Stealth Token
-        val scanResults = wifiManager.scanResults
-        if (scanResults.isEmpty()) return "ERR_WIFI_CACHE_EMPTY"
+    override fun onPause() {
+        try {
+            unregisterReceiver(debugReceiver)
+        } catch (_: Exception) {
+        }
+        super.onPause()
+    }
+}
 
-        var sawTarget = false
-        var targetDebug = "IEs:"
-        var token: ByteArray? = null
+object AppKeyMaterial {
+    private const val PREFS_NAME = "doorlink_app_keys"
+    private const val PUBLIC_KEY_B64 = "public_key_b64"
+    private const val PRIVATE_KEY_B64 = "private_key_b64"
 
-        for (scanResult in scanResults) {
-            val isTargetAp = scanResult.SSID == "DL_DOOR"
-            if (isTargetAp) sawTarget = true
-
-            val ies = scanResult.informationElements ?: continue
-            for (ie in ies) {
-                if (isTargetAp) {
-                    targetDebug += "${ie.id}"
-                    if (ie.id == 221) {
-                        val buf = ie.bytes.asReadOnlyBuffer()
-                        val b = ByteArray(buf.remaining())
-                        buf.get(b)
-                        if (b.size >= 3) targetDebug += "[${String.format("%02X%02X%02X", b[0].toInt() and 0xFF, b[1].toInt() and 0xFF, b[2].toInt() and 0xFF)}-s${b.size}]"
-                    }
-                    targetDebug += ","
-                }
-
-                if (ie.id == 221) {
-                    val buffer = ie.bytes.asReadOnlyBuffer()
-                    val bytes = ByteArray(buffer.remaining())
-                    buffer.get(bytes)
-                    // Expecting: Apple OUI (00 17 F2) + OUI Type (42) + Token (6 bytes)
-                    if (bytes.size >= 10 && bytes[0] == 0x00.toByte() && bytes[1] == 0x17.toByte() && bytes[2] == 0xF2.toByte() && bytes[3] == 0x42.toByte()) {
-                        token = bytes.copyOfRange(4, 10)
-                        break
-                    }
-                }
+    fun getOrCreate(context: Context): KeyPair {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val publicB64 = prefs.getString(PUBLIC_KEY_B64, null)
+        val privateB64 = prefs.getString(PRIVATE_KEY_B64, null)
+        if (!publicB64.isNullOrBlank() && !privateB64.isNullOrBlank()) {
+            try {
+                val keyFactory = KeyFactory.getInstance("EC")
+                val publicKey = keyFactory.generatePublic(X509EncodedKeySpec(Base64.decode(publicB64, Base64.DEFAULT)))
+                val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(Base64.decode(privateB64, Base64.DEFAULT)))
+                return KeyPair(publicKey, privateKey)
+            } catch (_: Exception) {
+                prefs.edit().remove(PUBLIC_KEY_B64).remove(PRIVATE_KEY_B64).apply()
             }
-            if (token != null) break
         }
 
-        if (token == null) {
-            return if (sawTarget) targetDebug else "ERR_AP_NOT_IN_CACHE"
-        }
-
-        // 2. Broadcast BLE Mirrored Claim
-        val userIdBytes = hexStringToByteArray(userIdHex)
-        if (userIdBytes.size != 4) return "ERR_INVALID_USER_ID"
-
-        val padding = ByteArray(10) { 0x00 }
-        val manufacturerData = userIdBytes + token + padding // User_ID (4) + Token (6) + Padding (10) = 20 bytes
-
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH) // Crucial for ESP32 -73dBm threshold
-            .setConnectable(false)
-            .build()
-
-        val data = AdvertiseData.Builder()
-            .addManufacturerData(0x0143, manufacturerData)
-            .build()
-
-        advertiser?.startAdvertising(settings, data, object : AdvertiseCallback() {})
-        return "SUCCESS"
+        val generator = KeyPairGenerator.getInstance("EC")
+        generator.initialize(ECGenParameterSpec("secp256r1"))
+        val keyPair = generator.generateKeyPair()
+        prefs.edit()
+            .putString(PUBLIC_KEY_B64, Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP))
+            .putString(PRIVATE_KEY_B64, Base64.encodeToString(keyPair.private.encoded, Base64.NO_WRAP))
+            .apply()
+        return keyPair
     }
 
-    private fun hexStringToByteArray(s: String): ByteArray {
-        val data = ByteArray(s.length / 2)
-        for (i in s.indices step 2) {
-            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
-        }
-        return data
-    }
 }

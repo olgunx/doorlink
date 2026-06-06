@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 #define ENROLLMENT_MAX_DEVICES 10
-#define ENROLLMENT_PUBKEY_LEN  32
+#define ENROLLMENT_PUBKEY_LEN  65
 
 typedef struct {
     uint8_t user_id[LIGHTHOUSE_USER_ID_LEN];

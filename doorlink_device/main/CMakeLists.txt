@@ -1,5 +1,13 @@
 idf_component_register(
-    SRC_DIRS "."
+    SRCS
+        "app_main.c"
+        "ble_scanner.c"
+        "device_key.c"
+        "device_tracker.c"
+        "enrollment_mgr.c"
+        "proximity_engine.c"
+        "vl6180x.c"
+        "web_console.c"
     INCLUDE_DIRS "."
     REQUIRES
         bt

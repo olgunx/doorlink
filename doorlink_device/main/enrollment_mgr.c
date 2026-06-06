@@ -10,6 +10,18 @@ static const char *KEY_ADMIN_PASS = "admin_pass";
 static const char *KEY_DEVICES = "devices";
 
 static nvs_handle_t s_handle;
+static enrolled_device_t s_device_cache[ENROLLMENT_MAX_DEVICES];
+static bool s_cache_valid = false;
+
+static void update_cache(void)
+{
+    memset(s_device_cache, 0, sizeof(s_device_cache));
+    s_cache_valid = false;
+    size_t size = sizeof(s_device_cache);
+    if (nvs_get_blob(s_handle, KEY_DEVICES, s_device_cache, &size) == ESP_OK) {
+        s_cache_valid = true;
+    }
+}
 
 esp_err_t enrollment_mgr_init(void)
 {
@@ -35,6 +47,15 @@ esp_err_t enrollment_mgr_init(void)
         nvs_set_blob(s_handle, KEY_DEVICES, empty_list, sizeof(empty_list));
         nvs_commit(s_handle);
     }
+    
+    update_cache();
+    size_t active_count = 0;
+    for (int i = 0; i < ENROLLMENT_MAX_DEVICES; i++) {
+        if (s_device_cache[i].active) {
+            active_count++;
+        }
+    }
+    ESP_LOGI(TAG, "enrollment cache ready active_devices=%u", (unsigned int)active_count);
 
     return ESP_OK;
 }
@@ -73,7 +94,10 @@ esp_err_t enrollment_mgr_add_device(const uint8_t *user_id, const uint8_t *pubke
             // Device exists, update pubkey
             memcpy(devices[i].pubkey, pubkey, ENROLLMENT_PUBKEY_LEN);
             err = nvs_set_blob(s_handle, KEY_DEVICES, devices, sizeof(devices));
-            if (err == ESP_OK) nvs_commit(s_handle);
+            if (err == ESP_OK) {
+                nvs_commit(s_handle);
+                update_cache();
+            }
             return err;
         }
         if (!devices[i].active && empty_slot == -1) {
@@ -90,6 +114,7 @@ esp_err_t enrollment_mgr_add_device(const uint8_t *user_id, const uint8_t *pubke
     err = nvs_set_blob(s_handle, KEY_DEVICES, devices, sizeof(devices));
     if (err == ESP_OK) {
         nvs_commit(s_handle);
+        update_cache();
     }
     return err;
 }
@@ -112,16 +137,25 @@ esp_err_t enrollment_mgr_revoke_device(const uint8_t *user_id)
 
     if (found) {
         err = nvs_set_blob(s_handle, KEY_DEVICES, devices, sizeof(devices));
-        if (err == ESP_OK) nvs_commit(s_handle);
+        if (err == ESP_OK) {
+            nvs_commit(s_handle);
+            update_cache();
+        }
     }
     return err;
 }
 
 size_t enrollment_mgr_get_devices(enrolled_device_t *out_devices, size_t max_devices)
 {
-    enrolled_device_t devices[ENROLLMENT_MAX_DEVICES];
+    if (out_devices == NULL || max_devices == 0) {
+        return 0;
+    }
+
+    enrolled_device_t devices[ENROLLMENT_MAX_DEVICES] = {0};
     size_t size = sizeof(devices);
-    if (nvs_get_blob(s_handle, KEY_DEVICES, devices, &size) != ESP_OK) return 0;
+    if (nvs_get_blob(s_handle, KEY_DEVICES, devices, &size) != ESP_OK) {
+        return 0;
+    }
 
     size_t count = 0;
     for (int i = 0; i < ENROLLMENT_MAX_DEVICES && count < max_devices; i++) {
@@ -134,10 +168,15 @@ size_t enrollment_mgr_get_devices(enrolled_device_t *out_devices, size_t max_dev
 
 bool enrollment_mgr_is_device_active(const uint8_t *user_id, uint8_t *out_pubkey)
 {
-    // We can call get_devices or just iterate to look for it.
-    enrolled_device_t devices[ENROLLMENT_MAX_DEVICES];
+    if (user_id == NULL) {
+        return false;
+    }
+
+    enrolled_device_t devices[ENROLLMENT_MAX_DEVICES] = {0};
     size_t size = sizeof(devices);
-    if (nvs_get_blob(s_handle, KEY_DEVICES, devices, &size) != ESP_OK) return false;
+    if (nvs_get_blob(s_handle, KEY_DEVICES, devices, &size) != ESP_OK) {
+        return false;
+    }
 
     for (int i = 0; i < ENROLLMENT_MAX_DEVICES; i++) {
         if (devices[i].active && memcmp(devices[i].user_id, user_id, LIGHTHOUSE_USER_ID_LEN) == 0) {
