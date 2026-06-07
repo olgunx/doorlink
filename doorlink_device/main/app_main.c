@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "mbedtls/md.h"
 #include "mbedtls/ecdh.h"
@@ -61,6 +62,7 @@ static nvs_handle_t s_nvs = 0;
 static uint8_t s_vendor_ie_buf_a[sizeof(vendor_ie_data_t) + LIGHTHOUSE_TOKEN_LEN] __attribute__((aligned(4)));
 static uint8_t s_vendor_ie_buf_b[sizeof(vendor_ie_data_t) + LIGHTHOUSE_TOKEN_LEN] __attribute__((aligned(4)));
 static uint8_t *s_vendor_ie_active = NULL;
+static QueueHandle_t s_claim_queue = NULL;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
 static const char *bytes_to_hex(const uint8_t *bytes, size_t len, char *buf, size_t buf_size)
@@ -255,6 +257,48 @@ static bool compute_expected_response(const uint8_t *user_id, const uint8_t *cha
     return true;
 }
 
+static void auth_task(void *arg)
+{
+    (void)arg;
+    lighthouse_ble_claim_t claim;
+    while (true) {
+        if (xQueueReceive(s_claim_queue, &claim, portMAX_DELAY)) {
+            uint8_t enrolled_pubkey[ENROLLMENT_PUBKEY_LEN] = {0};
+            if (enrollment_mgr_is_device_active(claim.user_id, enrolled_pubkey)) {
+                if (!s_enrolled_pubkey_logged) {
+                    s_enrolled_pubkey_logged = true;
+                    char pubkey_hex[ENROLLMENT_PUBKEY_LEN * 2 + 1];
+                    ESP_LOGI(TAG, "enrolled pubkey=%s",
+                             bytes_to_hex(enrolled_pubkey, ENROLLMENT_PUBKEY_LEN, pubkey_hex, sizeof(pubkey_hex)));
+                }
+
+                uint8_t expected_response[LIGHTHOUSE_RESPONSE_LEN] = {0};
+                const bool active_challenge_match = memcmp(claim.challenge, s_active_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
+                const bool previous_challenge_match = s_previous_challenge_valid_until_ms != 0 &&
+                                                      now_ms() <= s_previous_challenge_valid_until_ms &&
+                                                      memcmp(claim.challenge, s_previous_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
+                const bool response_ok = compute_expected_response(claim.user_id, claim.challenge, enrolled_pubkey, expected_response) &&
+                                         memcmp(claim.response, expected_response, LIGHTHOUSE_RESPONSE_LEN) == 0;
+
+                if ((active_challenge_match || previous_challenge_match) &&
+                    response_ok &&
+                    now_ms() >= s_burn_cooldown_until_ms) {
+                    s_claim_match_count++;
+                    s_authorized = true;
+                    s_auth_window_started_ms = now_ms();
+                } else {
+                    const uint32_t now = now_ms();
+                    if (s_last_mismatch_log_ms == 0 || (now - s_last_mismatch_log_ms) >= 2000) {
+                        s_last_mismatch_log_ms = now;
+                    }
+                }
+            }
+            // Yield to allow IDLE task to run and reset watchdog in case of a heavy flood of BLE claims
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
 static void claim_detected(const lighthouse_ble_claim_t *claim)
 {
     if (claim == NULL) {
@@ -266,36 +310,9 @@ static void claim_detected(const lighthouse_ble_claim_t *claim)
     s_arrived = claim->rssi >= BEACON_ARRIVED_RSSI_DBM;
     memcpy(s_last_user_id, claim->user_id, LIGHTHOUSE_USER_ID_LEN);
 
-    uint8_t enrolled_pubkey[ENROLLMENT_PUBKEY_LEN] = {0};
-    if (!enrollment_mgr_is_device_active(claim->user_id, enrolled_pubkey)) {
-        return;
-    }
-    if (!s_enrolled_pubkey_logged) {
-        s_enrolled_pubkey_logged = true;
-        char pubkey_hex[ENROLLMENT_PUBKEY_LEN * 2 + 1];
-        ESP_LOGI(TAG, "enrolled pubkey=%s",
-                 bytes_to_hex(enrolled_pubkey, ENROLLMENT_PUBKEY_LEN, pubkey_hex, sizeof(pubkey_hex)));
-    }
-
-    uint8_t expected_response[LIGHTHOUSE_RESPONSE_LEN] = {0};
-    const bool active_challenge_match = memcmp(claim->challenge, s_active_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
-    const bool previous_challenge_match = s_previous_challenge_valid_until_ms != 0 &&
-                                          now_ms() <= s_previous_challenge_valid_until_ms &&
-                                          memcmp(claim->challenge, s_previous_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
-    const bool response_ok = compute_expected_response(claim->user_id, claim->challenge, enrolled_pubkey, expected_response) &&
-                             memcmp(claim->response, expected_response, LIGHTHOUSE_RESPONSE_LEN) == 0;
-
-    if ((active_challenge_match || previous_challenge_match) &&
-        response_ok &&
-        now_ms() >= s_burn_cooldown_until_ms) {
-        s_claim_match_count++;
-        s_authorized = true;
-        s_auth_window_started_ms = now_ms();
-    } else {
-        const uint32_t now = now_ms();
-        if (s_last_mismatch_log_ms == 0 || (now - s_last_mismatch_log_ms) >= 2000) {
-            s_last_mismatch_log_ms = now;
-        }
+    // Send to queue to offload heavy crypto from nimble_host task
+    if (s_claim_queue != NULL) {
+        xQueueOverwrite(s_claim_queue, claim);
     }
 }
 
@@ -486,6 +503,9 @@ void app_main(void)
     ESP_ERROR_CHECK(ble_scanner_set_static_uuid_beacon(STATIC_UUID));
     ble_scanner_set_claim_detected_cb(claim_detected);
     ESP_ERROR_CHECK(ble_scanner_init());
+
+    s_claim_queue = xQueueCreate(1, sizeof(lighthouse_ble_claim_t));
+    xTaskCreate(auth_task, "auth_task", 8192, NULL, 5, NULL);
 
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
     xTaskCreate(relay_task, "relay_task", 2048, NULL, 5, NULL);

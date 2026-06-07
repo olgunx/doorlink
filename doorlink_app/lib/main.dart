@@ -172,10 +172,8 @@ class _MainAppScreenState extends State<MainAppScreen> {
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.notification,
+      Permission.location,
     ];
-    if (!Platform.isAndroid || sdkInt < 31) {
-      permissionsToRequest.add(Permission.location);
-    }
 
     // Request all necessary system hardware permissions
     Map<Permission, PermissionStatus> statuses = await permissionsToRequest.request();
