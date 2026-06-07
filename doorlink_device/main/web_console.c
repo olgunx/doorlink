@@ -304,6 +304,23 @@ static esp_err_t api_unlock_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, "{\"status\": \"ok\"}", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t api_pubkey_get_handler(httpd_req_t *req)
+{
+    char esp_pub_hex[DEVICE_KEY_PUB_LEN * 2 + 1] = {0};
+    if (device_key_get_public_hex(esp_pub_hex, sizeof(esp_pub_hex)) == 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "pubkey", esp_pub_hex);
+    const char *json_str = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+    cJSON_free((void *)json_str);
+    cJSON_Delete(root);
+    return ret;
+}
+
 static httpd_uri_t root_get = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
 static httpd_uri_t login_post = { .uri = "/login", .method = HTTP_POST, .handler = login_post_handler };
 static httpd_uri_t status_get = { .uri = "/status", .method = HTTP_GET, .handler = status_get_handler };
@@ -311,11 +328,12 @@ static httpd_uri_t api_enrollments_get = { .uri = "/api/enrollments", .method = 
 static httpd_uri_t api_save_post = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
 static httpd_uri_t api_revoke_post = { .uri = "/api/revoke", .method = HTTP_POST, .handler = api_revoke_post_handler };
 static httpd_uri_t api_unlock_post = { .uri = "/api/unlock", .method = HTTP_POST, .handler = api_unlock_post_handler };
+static httpd_uri_t api_pubkey_get = { .uri = "/api/pubkey", .method = HTTP_GET, .handler = api_pubkey_get_handler };
 
 esp_err_t web_console_init(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10; 
+    config.max_uri_handlers = 12; 
     
     ESP_LOGI(TAG, "Starting admin web server on port: '%d'", config.server_port);
     if (httpd_start(&s_server, &config) == ESP_OK) {
@@ -326,6 +344,7 @@ esp_err_t web_console_init(void)
         httpd_register_uri_handler(s_server, &api_save_post);
         httpd_register_uri_handler(s_server, &api_revoke_post);
         httpd_register_uri_handler(s_server, &api_unlock_post);
+        httpd_register_uri_handler(s_server, &api_pubkey_get);
         return ESP_OK;
     }
     

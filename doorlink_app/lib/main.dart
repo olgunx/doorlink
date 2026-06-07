@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 import 'dart:io' show Platform, HttpClient;
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -38,8 +39,10 @@ class _MainAppScreenState extends State<MainAppScreen> {
   int _currentIndex = 0;
   bool _isActive = true;
   String _userId = "";
+  String _espPublicKey = "";
   String _appPublicKey = "";
   late TextEditingController _userIdController;
+  late TextEditingController _espPubKeyController;
   late TextEditingController _pubKeyController;
 
   // Engine State
@@ -68,6 +71,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
   void initState() {
     super.initState();
     _userIdController = TextEditingController(text: _userId);
+    _espPubKeyController = TextEditingController(text: _espPublicKey);
     _pubKeyController = TextEditingController(text: _appPublicKey);
     _status = 'Loading credentials...';
     platform.setMethodCallHandler(_handleNativeCall);
@@ -106,6 +110,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
     try {
       final stored = await platform.invokeMethod<Map<dynamic, dynamic>>('getStoredCredentials');
       final storedUserId = stored?['userId']?.toString().trim() ?? '';
+      final storedEspPubKey = stored?['espPubKey']?.toString().trim() ?? '';
       final appPubKey = await platform.invokeMethod<String>('getAppPublicKey') ?? '';
       _addLog('Loaded creds: userId=${storedUserId.isNotEmpty ? storedUserId : "(new)"} pubKeyLen=${appPubKey.length}');
 
@@ -114,14 +119,17 @@ class _MainAppScreenState extends State<MainAppScreen> {
       if (storedUserId.isEmpty) {
         await platform.invokeMethod('saveStoredCredentials', {
           'userId': nextUserId,
+          'espPubKey': storedEspPubKey,
         });
       }
 
       if (!mounted) return;
       setState(() {
         _userId = nextUserId;
+        _espPublicKey = storedEspPubKey;
         _appPublicKey = appPubKey;
         _userIdController.text = nextUserId;
+        _espPubKeyController.text = storedEspPubKey;
         _pubKeyController.text = appPubKey;
         _status = appPubKey.isNotEmpty ? 'Credentials ready' : 'Credentials unavailable yet';
       });
@@ -138,6 +146,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
   void dispose() {
     platform.setMethodCallHandler(null);
     _userIdController.dispose();
+    _espPubKeyController.dispose();
     _pubKeyController.dispose();
     super.dispose();
   }
@@ -196,6 +205,12 @@ class _MainAppScreenState extends State<MainAppScreen> {
 
     if (!mounted || !_isActive) return;
 
+    if (_espPublicKey.isEmpty) {
+      setState(() => _status = 'Missing Lock Public Key! Pair first.');
+      _addLog("Error: Missing Lock Public Key. Pair via Wi-Fi.");
+      return;
+    }
+
     setState(() {
       _status = 'Starting background service...';
       _addLog("SC[X]BG[ ]CH[ ]AD[ ]OK[ ]");
@@ -207,9 +222,11 @@ class _MainAppScreenState extends State<MainAppScreen> {
     try {
       await platform.invokeMethod('saveStoredCredentials', {
         'userId': _userId,
+        'espPubKey': _espPublicKey,
       });
       await platform.invokeMethod('startBackgroundService', {
         'userId': _userId,
+        'espPubKey': _espPublicKey,
         'serviceUuid': '0000fcd2-0000-1000-8000-00805f9b34fb',
       });
       if (!mounted || !_isActive) return;
@@ -245,12 +262,14 @@ class _MainAppScreenState extends State<MainAppScreen> {
     try {
       await platform.invokeMethod('startBackgroundService', {
         'userId': 'MANUAL_$_userId',
+        'espPubKey': _espPublicKey,
         'serviceUuid': '0000fcd3-0000-1000-8000-00805f9b34fb',
       });
       Future.delayed(const Duration(seconds: 5), () {
         if (_isActive && mounted) {
           platform.invokeMethod('startBackgroundService', {
             'userId': _userId,
+            'espPubKey': _espPublicKey,
             'serviceUuid': '0000fcd2-0000-1000-8000-00805f9b34fb',
           });
         }
@@ -286,6 +305,40 @@ class _MainAppScreenState extends State<MainAppScreen> {
       return value ?? false;
     } on PlatformException {
       return false;
+    }
+  }
+
+  Future<void> _fetchPubKeyFromAP() async {
+    _addLog('Attempting to fetch Lock Public Key from AP...');
+    setState(() => _status = 'Fetching key from AP...');
+    try {
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 3);
+      final request = await client.getUrl(Uri.parse('http://192.168.4.1/api/pubkey'));
+      final response = await request.close();
+      if (response.statusCode == 200) {
+        final responseBody = await response.transform(utf8.decoder).join();
+        final json = jsonDecode(responseBody);
+        final fetchedKey = json['pubkey']?.toString() ?? '';
+        if (fetchedKey.isNotEmpty) {
+          setState(() {
+            _espPublicKey = fetchedKey;
+            _espPubKeyController.text = fetchedKey;
+            _status = 'Successfully fetched Lock Public Key';
+          });
+          _addLog('Successfully fetched Lock Public Key!');
+          await platform.invokeMethod('saveStoredCredentials', {
+            'userId': _userId,
+            'espPubKey': _espPublicKey,
+          });
+        }
+      } else {
+        setState(() => _status = 'Failed to fetch key (HTTP ${response.statusCode})');
+        _addLog('HTTP error ${response.statusCode}');
+      }
+    } catch (e) {
+      setState(() => _status = 'Not connected to DL_DOOR AP?');
+      _addLog('Fetch failed: $e');
     }
   }
 
@@ -379,6 +432,27 @@ class _MainAppScreenState extends State<MainAppScreen> {
             },
           ),
         const SizedBox(height: 20),
+          TextField(
+            controller: _espPubKeyController,
+            decoration: const InputDecoration(
+              labelText: 'Lock Public Key',
+              border: OutlineInputBorder(),
+              helperText: 'Required to unlock your specific door.',
+            ),
+            onChanged: (val) {
+              _espPublicKey = val;
+            },
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _fetchPubKeyFromAP,
+              icon: const Icon(Icons.wifi),
+              label: const Text('Pair with Lock (Fetch Key from AP)'),
+            ),
+          ),
+          const SizedBox(height: 20),
           TextField(
             controller: _pubKeyController,
             readOnly: true,

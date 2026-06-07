@@ -40,18 +40,16 @@ class BeaconService : Service() {
     private val logTag = "DoorLinkBeacon"
     companion object {
         const val EXTRA_USER_ID = "extra_user_id"
+        const val EXTRA_ESP_PUB_KEY = "extra_esp_pub_key"
         const val ACTION_STOP = "com.example.blebeacon.action.STOP"
         const val ACTION_DEBUG_STATUS = "com.example.blebeacon.action.DEBUG_STATUS"
         const val EXTRA_DEBUG_MESSAGE = "extra_debug_message"
 
-        private const val MANUFACTURER_ID_CHALLENGE = 0x0144
-        private const val MANUFACTURER_ID_RESPONSE = 0x0143
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "doorlink_bg"
         private const val ADVERTISE_HOLD_MS = 2500L
         private const val RESPONSE_RETRY_MS = 3000L
         private const val STATIC_UUID_HEX = "9f82c41d3b7a4291a1e6b5293d0cfa82"
-        private const val ESP_PUBLIC_KEY_HEX = "0446812cfc171d1e1f3cc2bcfe33d057b359a0e7d0192f6072b0ef7c4bf3e0fdac9663c30067311505a45df3133bf4a10f1ec4730763b921d2e0678092eedf28ff"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -67,6 +65,9 @@ class BeaconService : Service() {
         ParcelUuid(Utils.uuidFrom16Bytes(hexStringToByteArray(STATIC_UUID_HEX)))
     }
     private var serviceStarted = false
+
+    private var espPublicKeyHex: String = ""
+    private var lockId: Int = 0
 
     private val responseRetryRunnable = object : Runnable {
         override fun run() {
@@ -99,6 +100,22 @@ class BeaconService : Service() {
         if (intent?.action == ACTION_STOP) {
             emitDebug("Stop requested")
             stopEverything()
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+
+        val espPubKeyHexIntent = intent?.getStringExtra(EXTRA_ESP_PUB_KEY)?.trim().orEmpty()
+        if (espPubKeyHexIntent.isBlank()) {
+            emitDebug("Missing ESP Public Key")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        espPublicKeyHex = espPubKeyHexIntent
+        val keyBytes = hexStringToByteArray(espPublicKeyHex)
+        if (keyBytes.size >= 3) {
+            lockId = ((keyBytes[1].toInt() and 0xFF) shl 8) or (keyBytes[2].toInt() and 0xFF)
+        } else {
+            emitDebug("Invalid ESP Public Key")
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -158,7 +175,15 @@ class BeaconService : Service() {
             return
         }
 
-        val filters = emptyList<ScanFilter>()
+        // Tell the Android OS to ONLY wake up our app if it sees our Manufacturer ID (0x0144).
+        // The mask of zeros tells the OS we don't care what the 8-byte puzzle is, just pass it through!
+        val filter = ScanFilter.Builder()
+            .setManufacturerData(
+                lockId, 
+                byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0), 
+                byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0))
+            .build()
+        val filters = listOf(filter)
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -174,7 +199,7 @@ class BeaconService : Service() {
 
     private fun handleScanResult(result: ScanResult) {
         val record = result.scanRecord ?: return
-        val challengeBytes = record.getManufacturerSpecificData(MANUFACTURER_ID_CHALLENGE) ?: return
+        val challengeBytes = record.getManufacturerSpecificData(lockId) ?: return
         if (challengeBytes.size < 8) return
 
         val challenge = challengeBytes.copyOfRange(0, 8)
@@ -212,7 +237,7 @@ class BeaconService : Service() {
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
-            .addManufacturerData(MANUFACTURER_ID_RESPONSE, payload)
+            .addManufacturerData(lockId, payload)
             .build()
 
         val scanResponse = AdvertiseData.Builder()
@@ -242,7 +267,7 @@ class BeaconService : Service() {
     private fun computeResponse(userId: ByteArray, challenge: ByteArray): ByteArray? {
         return try {
             val keyPair = ensureKeyPair() ?: return null
-            val espPublic = decodePublicKey(ESP_PUBLIC_KEY_HEX)
+            val espPublic = decodePublicKey(espPublicKeyHex)
             val secret = deriveSharedSecret(keyPair.private, espPublic)
             if (secret.isEmpty()) return null
             val mac = Mac.getInstance("HmacSHA256")

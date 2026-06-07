@@ -48,29 +48,37 @@ class MainActivity : FlutterActivity() {
                 "getStoredCredentials" -> {
                     val prefs = getSharedPreferences("doorlink_credentials", Context.MODE_PRIVATE)
                     val userId = prefs.getString("user_id", "") ?: ""
-                    result.success(mapOf("userId" to userId))
+                    val espPubKey = prefs.getString("esp_pub_key", "") ?: ""
+                    result.success(mapOf("userId" to userId, "espPubKey" to espPubKey))
                 }
                 "saveStoredCredentials" -> {
                     val userId = call.argument<String>("userId")?.trim().orEmpty()
+                    val espPubKey = call.argument<String>("espPubKey")?.trim()
                     if (userId.isBlank()) {
                         result.error("ERR_BAD_ARGS", "Missing userId", null)
                         return@setMethodCallHandler
                     }
-                    getSharedPreferences("doorlink_credentials", Context.MODE_PRIVATE)
-                        .edit()
-                        .putString("user_id", userId)
-                        .apply()
+                    val edit = getSharedPreferences("doorlink_credentials", Context.MODE_PRIVATE).edit()
+                    edit.putString("user_id", userId)
+                    if (espPubKey != null) edit.putString("esp_pub_key", espPubKey)
+                    edit.apply()
                     result.success("OK")
                 }
                 "startBackgroundService" -> {
                     val userId = call.argument<String>("userId")?.trim().orEmpty()
+                    val espPubKey = call.argument<String>("espPubKey")?.trim().orEmpty()
                     if (userId.isBlank()) {
                         result.error("ERR_BAD_ARGS", "Missing userId", null)
+                        return@setMethodCallHandler
+                    }
+                    if (espPubKey.isBlank()) {
+                        result.error("ERR_BAD_ARGS", "Missing espPubKey", null)
                         return@setMethodCallHandler
                     }
 
                     val intent = Intent(this, BeaconService::class.java).apply {
                         putExtra(BeaconService.EXTRA_USER_ID, userId)
+                        putExtra(BeaconService.EXTRA_ESP_PUB_KEY, espPubKey)
                     }
                     ContextCompat.startForegroundService(this, intent)
                     result.success("OK")

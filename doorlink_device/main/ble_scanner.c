@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "device_key.h"
 #include "config.h"
 #include "esp_log.h"
 #include "host/ble_gap.h"
@@ -60,7 +61,8 @@ esp_err_t ble_scanner_set_challenge_beacon(const uint8_t *challenge_8_bytes)
 static bool extract_claim(const struct ble_hs_adv_fields *fields, lighthouse_ble_claim_t *claim)
 {
     const size_t expected_len = LIGHTHOUSE_USER_ID_LEN + LIGHTHOUSE_CHALLENGE_LEN + LIGHTHOUSE_RESPONSE_LEN;
-    const uint16_t expected_company_id_le = 0x0143;
+    const uint8_t *pub_key = device_key_get_public();
+    const uint16_t expected_company_id_le = (uint16_t)pub_key[2] | ((uint16_t)pub_key[1] << 8);
     if (fields->mfg_data == NULL) {
         return false;
     }
@@ -197,9 +199,10 @@ static void start_adv(void)
     fields.uuids16_is_complete = 1;
 
     if (s_challenge_set) {
+        const uint8_t *pub_key = device_key_get_public();
         static uint8_t challenge_mfg_buf[2 + LIGHTHOUSE_CHALLENGE_LEN];
-        challenge_mfg_buf[0] = 0x44;
-        challenge_mfg_buf[1] = 0x01;
+        challenge_mfg_buf[0] = pub_key[2]; // Little Endian LSB
+        challenge_mfg_buf[1] = pub_key[1]; // Little Endian MSB
         memcpy(&challenge_mfg_buf[2], s_challenge_nonce, LIGHTHOUSE_CHALLENGE_LEN);
         fields.mfg_data = challenge_mfg_buf;
         fields.mfg_data_len = sizeof(challenge_mfg_buf);
