@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:math';
-import 'dart:io' show Platform;
+import 'dart:io' show Platform, HttpClient;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -36,7 +36,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
   
   // UI State
   int _currentIndex = 0;
-  bool _isActive = false;
+  bool _isActive = true;
   String _userId = "";
   String _appPublicKey = "";
   late TextEditingController _userIdController;
@@ -71,7 +71,9 @@ class _MainAppScreenState extends State<MainAppScreen> {
     _pubKeyController = TextEditingController(text: _appPublicKey);
     _status = 'Loading credentials...';
     platform.setMethodCallHandler(_handleNativeCall);
-    _loadOrCreateCredentials();
+    _loadOrCreateCredentials().then((_) {
+      if (_isActive) _initListening();
+    });
   }
 
   Future<void> _handleNativeCall(MethodCall call) async {
@@ -208,6 +210,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
       });
       await platform.invokeMethod('startBackgroundService', {
         'userId': _userId,
+        'serviceUuid': '0000fcd2-0000-1000-8000-00805f9b34fb',
       });
       if (!mounted || !_isActive) return;
       setState(() {
@@ -221,6 +224,39 @@ class _MainAppScreenState extends State<MainAppScreen> {
         _status = "Error: '${e.message}'";
       });
       _addLog("Background start failed: ${e.message ?? 'unknown'}");
+    }
+  }
+
+  Future<void> _manualUnlock() async {
+    _addLog('Manual unlock requested...');
+    try {
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 2);
+      final request = await client.postUrl(Uri.parse('http://192.168.4.1/api/unlock'));
+      final response = await request.close();
+      if (response.statusCode == 200) {
+        _addLog('Manual unlock signal sent via Wi-Fi!');
+        return;
+      }
+    } catch (e) {
+      _addLog('Wi-Fi manual unlock failed. Trying BLE fallback...');
+    }
+    
+    try {
+      await platform.invokeMethod('startBackgroundService', {
+        'userId': 'MANUAL_$_userId',
+        'serviceUuid': '0000fcd3-0000-1000-8000-00805f9b34fb',
+      });
+      Future.delayed(const Duration(seconds: 5), () {
+        if (_isActive && mounted) {
+          platform.invokeMethod('startBackgroundService', {
+            'userId': _userId,
+            'serviceUuid': '0000fcd2-0000-1000-8000-00805f9b34fb',
+          });
+        }
+      });
+    } catch (e) {
+      _addLog('BLE fallback failed: $e');
     }
   }
 
@@ -277,6 +313,15 @@ class _MainAppScreenState extends State<MainAppScreen> {
             value: _isActive,
             activeThumbColor: Colors.green,
             onChanged: _toggleService,
+          ),
+          const SizedBox(height: 20),
+          ElevatedButton.icon(
+            onPressed: _isActive ? _manualUnlock : null,
+            icon: const Icon(Icons.sensor_door),
+            label: const Padding(
+              padding: EdgeInsets.all(12.0),
+              child: Text('Manual Unlock', style: TextStyle(fontSize: 18)),
+            ),
           ),
         ],
       ),

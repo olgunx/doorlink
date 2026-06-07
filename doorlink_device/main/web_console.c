@@ -18,6 +18,8 @@ static httpd_handle_t s_server = NULL;
 static uint32_t s_session_token = 0;
 static uint32_t s_session_expires = 0;
 
+extern void trigger_manual_unlock(void);
+
 size_t web_console_get_esp_public_key_hex(char *out, size_t out_size)
 {
     return device_key_get_public_hex(out, out_size);
@@ -295,12 +297,20 @@ static esp_err_t api_revoke_post_handler(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
+static esp_err_t api_unlock_post_handler(httpd_req_t *req)
+{
+    trigger_manual_unlock();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"status\": \"ok\"}", HTTPD_RESP_USE_STRLEN);
+}
+
 static httpd_uri_t root_get = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
 static httpd_uri_t login_post = { .uri = "/login", .method = HTTP_POST, .handler = login_post_handler };
 static httpd_uri_t status_get = { .uri = "/status", .method = HTTP_GET, .handler = status_get_handler };
 static httpd_uri_t api_enrollments_get = { .uri = "/api/enrollments", .method = HTTP_GET, .handler = api_enrollments_get_handler };
 static httpd_uri_t api_save_post = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
 static httpd_uri_t api_revoke_post = { .uri = "/api/revoke", .method = HTTP_POST, .handler = api_revoke_post_handler };
+static httpd_uri_t api_unlock_post = { .uri = "/api/unlock", .method = HTTP_POST, .handler = api_unlock_post_handler };
 
 esp_err_t web_console_init(void)
 {
@@ -315,6 +325,7 @@ esp_err_t web_console_init(void)
         httpd_register_uri_handler(s_server, &api_enrollments_get);
         httpd_register_uri_handler(s_server, &api_save_post);
         httpd_register_uri_handler(s_server, &api_revoke_post);
+        httpd_register_uri_handler(s_server, &api_unlock_post);
         return ESP_OK;
     }
     

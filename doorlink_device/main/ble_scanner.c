@@ -14,31 +14,24 @@
 static const char *TAG = "ble_scanner";
 static uint8_t s_own_addr_type;
 static lighthouse_claim_detected_cb_t s_claim_cb;
-static ble_uuid128_t s_static_uuid;
-static bool s_uuid_set;
 static bool s_adv_disabled;
 static uint8_t s_challenge_nonce[LIGHTHOUSE_CHALLENGE_LEN];
 static bool s_challenge_set;
-static bool s_adv_running;
 static volatile uint32_t s_disc_count;
 static volatile uint32_t s_claim_count;
+static volatile bool s_mac_rotation_pending = false;
+static ble_uuid16_t s_static_uuid16 = BLE_UUID16_INIT(0xFCD2);
+static bool s_host_synced = false;
+
+#define RADIO_STATE_SCANNING    (1 << 0)
+#define RADIO_STATE_ADVERTISING (1 << 1)
+static volatile uint8_t s_radio_state = 0;
 
 static void start_scan(void);
 static void start_adv(void);
 static void refresh_adv(void);
 
-static const char *bytes_to_hex(const uint8_t *bytes, size_t len, char *buf, size_t buf_len)
-{
-    if (bytes == NULL || buf == NULL || buf_len == 0) {
-        return "(null)";
-    }
-    size_t offset = 0;
-    for (size_t i = 0; i < len && offset + 2 < buf_len; ++i) {
-        offset += snprintf(buf + offset, buf_len - offset, "%02x", bytes[i]);
-    }
-    buf[offset] = '\0';
-    return buf;
-}
+extern void trigger_manual_unlock(void);
 
 void ble_scanner_set_claim_detected_cb(lighthouse_claim_detected_cb_t cb)
 {
@@ -50,9 +43,6 @@ esp_err_t ble_scanner_set_static_uuid_beacon(const uint8_t *uuid_16_bytes)
     if (uuid_16_bytes == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    s_static_uuid.u.type = BLE_UUID_TYPE_128;
-    memcpy(s_static_uuid.value, uuid_16_bytes, sizeof(s_static_uuid.value));
-    s_uuid_set = true;
     return ESP_OK;
 }
 
@@ -107,6 +97,27 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg)
         int rc = ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data);
         s_disc_count++;
 
+        if (rc == 0) {
+            if (fields.uuids16 != NULL) {
+                for (int i = 0; i < fields.num_uuids16; i++) {
+                    if (fields.uuids16[i].value == 0xFCD3) {
+                        trigger_manual_unlock();
+                    }
+                }
+            }
+            if (fields.uuids128 != NULL) {
+                static const uint8_t manual_uuid128[16] = {
+                    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                    0x00, 0x10, 0x00, 0x00, 0xd3, 0xfc, 0x00, 0x00
+                };
+                for (int i = 0; i < fields.num_uuids128; i++) {
+                    if (memcmp(fields.uuids128[i].value, manual_uuid128, 16) == 0) {
+                        trigger_manual_unlock();
+                    }
+                }
+            }
+        }
+
         if (rc != 0 || !extract_claim(&fields, &claim)) {
             return 0;
         }
@@ -117,11 +128,38 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg)
         return 0;
     }
     case BLE_GAP_EVENT_DISC_COMPLETE:
-        start_scan();
+        __atomic_fetch_and(&s_radio_state, ~RADIO_STATE_SCANNING, __ATOMIC_SEQ_CST);
+        if (s_mac_rotation_pending) {
+            if (s_radio_state == 0) {
+                s_mac_rotation_pending = false;
+                ble_addr_t rnd_addr;
+                if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+                    ble_hs_id_set_rnd(rnd_addr.val);
+                    s_own_addr_type = BLE_OWN_ADDR_RANDOM;
+                }
+                start_scan();
+                start_adv();
+            }
+        } else {
+            start_scan();
+        }
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        s_adv_running = false;
-        start_adv();
+        __atomic_fetch_and(&s_radio_state, ~RADIO_STATE_ADVERTISING, __ATOMIC_SEQ_CST);
+        if (s_mac_rotation_pending) {
+            if (s_radio_state == 0) {
+                s_mac_rotation_pending = false;
+                ble_addr_t rnd_addr;
+                if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+                    ble_hs_id_set_rnd(rnd_addr.val);
+                    s_own_addr_type = BLE_OWN_ADDR_RANDOM;
+                }
+                start_scan();
+                start_adv();
+            }
+        } else {
+            start_adv();
+        }
         return 0;
     default:
         return 0;
@@ -139,7 +177,9 @@ static void start_scan(void)
         .filter_duplicates = BLE_SCAN_FILTER_DUPLICATES,
     };
     int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &scan_params, ble_gap_cb, NULL);
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
+    if (rc == 0 || rc == BLE_HS_EALREADY) {
+        __atomic_fetch_or(&s_radio_state, RADIO_STATE_SCANNING, __ATOMIC_SEQ_CST);
+    } else {
         ESP_LOGE(TAG, "ble_gap_disc failed rc=%d", rc);
     }
 }
@@ -149,16 +189,21 @@ static void start_adv(void)
     if (s_adv_disabled) {
         return;
     }
-    if (!s_uuid_set) {
-        return;
-    }
 
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.uuids128 = &s_static_uuid;
-    fields.num_uuids128 = 1;
-    fields.uuids128_is_complete = 1;
+    fields.uuids16 = &s_static_uuid16;
+    fields.num_uuids16 = 1;
+    fields.uuids16_is_complete = 1;
+
+    if (s_challenge_set) {
+        static uint8_t challenge_mfg_buf[2 + LIGHTHOUSE_CHALLENGE_LEN];
+        challenge_mfg_buf[0] = 0x44;
+        challenge_mfg_buf[1] = 0x01;
+        memcpy(&challenge_mfg_buf[2], s_challenge_nonce, LIGHTHOUSE_CHALLENGE_LEN);
+        fields.mfg_data = challenge_mfg_buf;
+        fields.mfg_data_len = sizeof(challenge_mfg_buf);
+    }
 
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
@@ -167,51 +212,60 @@ static void start_adv(void)
         return;
     }
 
-    if (s_challenge_set) {
-        struct ble_hs_adv_fields rsp_fields;
-        memset(&rsp_fields, 0, sizeof(rsp_fields));
-        static uint8_t challenge_mfg_buf[2 + LIGHTHOUSE_CHALLENGE_LEN];
-        challenge_mfg_buf[0] = 0x44;
-        challenge_mfg_buf[1] = 0x01;
-        memcpy(&challenge_mfg_buf[2], s_challenge_nonce, LIGHTHOUSE_CHALLENGE_LEN);
-        rsp_fields.mfg_data = challenge_mfg_buf;
-        rsp_fields.mfg_data_len = sizeof(challenge_mfg_buf);
-        rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "ble adv rsp disabled (set_fields rc=%d); scanner remains active", rc);
-        }
-    }
 
     struct ble_gap_adv_params adv_params = {
         .conn_mode = BLE_GAP_CONN_MODE_NON,
-        .disc_mode = BLE_GAP_DISC_MODE_GEN,
+        .disc_mode = BLE_GAP_DISC_MODE_NON,
     };
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_cb, NULL);
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
-        ESP_LOGE(TAG, "ble_gap_adv_start failed rc=%d", rc);
+    if (rc == 0 || rc == BLE_HS_EALREADY) {
+        __atomic_fetch_or(&s_radio_state, RADIO_STATE_ADVERTISING, __ATOMIC_SEQ_CST);
     } else {
-        s_adv_running = true;
+        ESP_LOGE(TAG, "ble_gap_adv_start failed rc=%d", rc);
     }
 }
 
 static void refresh_adv(void)
 {
-    if (!s_uuid_set || s_adv_disabled) {
+    if (s_adv_disabled || !s_host_synced) {
         return;
     }
-    if (s_adv_running) {
-        (void)ble_gap_adv_stop();
-        s_adv_running = false;
+
+    s_mac_rotation_pending = true;
+
+    if (s_radio_state & RADIO_STATE_ADVERTISING) {
+        if (ble_gap_adv_stop() != 0) {
+            __atomic_fetch_and(&s_radio_state, ~RADIO_STATE_ADVERTISING, __ATOMIC_SEQ_CST);
+        }
     }
-    start_adv();
+    if (s_radio_state & RADIO_STATE_SCANNING) {
+        if (ble_gap_disc_cancel() != 0) {
+            __atomic_fetch_and(&s_radio_state, ~RADIO_STATE_SCANNING, __ATOMIC_SEQ_CST);
+        }
+    }
+
+    if (s_radio_state == 0) {
+        s_mac_rotation_pending = false;
+        ble_addr_t rnd_addr;
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+            ble_hs_id_set_rnd(rnd_addr.val);
+            s_own_addr_type = BLE_OWN_ADDR_RANDOM;
+        }
+        start_scan();
+        start_adv();
+    }
 }
 
 static void ble_on_sync(void)
 {
-    int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed rc=%d", rc);
-        return;
+    s_host_synced = true;
+    ble_addr_t rnd_addr;
+    if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+        ble_hs_id_set_rnd(rnd_addr.val);
+        s_own_addr_type = BLE_OWN_ADDR_RANDOM;
+    } else {
+        ESP_LOGW(TAG, "failed to gen random addr, fallback to auto");
+        ble_hs_id_infer_auto(0, &s_own_addr_type);
     }
     start_scan();
     start_adv();

@@ -65,6 +65,13 @@ static uint8_t *s_vendor_ie_active = NULL;
 static QueueHandle_t s_claim_queue = NULL;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
+
+volatile uint32_t g_manual_unlock_until_ms = 0;
+
+void trigger_manual_unlock(void) {
+    g_manual_unlock_until_ms = now_ms() + 5000;
+}
+
 static const char *bytes_to_hex(const uint8_t *bytes, size_t len, char *buf, size_t buf_size)
 {
     if (bytes == NULL || buf == NULL || buf_size == 0) {
@@ -345,7 +352,7 @@ static void status_task(void *arg)
         if (changed) {
             char ts[16];
             format_uptime(ts, sizeof(ts), now);
-            ESP_LOGI(TAG, "[%s] APP [%s] -> AUTH [%s] -> ARRIVED [%s] -> LASER [%s] -> RELAY [%s] (RX=%u MATCH=%u)",
+            ESP_LOGI(TAG, "[%s] APP[%s]-AUTH[%s]-ARRV[%s]-LSR[%s]-REL[%s] RX=%u MTCH=%u",
                      ts,
                      comm ? "X" : " ",
                      auth ? "X" : " ",
@@ -427,11 +434,14 @@ static void sensor_task(void *arg)
             s_laser_detected = false;
         }
 
-        if (s_authorized && s_arrived && s_laser_detected) {
+        bool manual_trigger = g_manual_unlock_until_ms && (int32_t)(g_manual_unlock_until_ms - now_ms()) > 0;
+
+        if (s_authorized && s_arrived && (s_laser_detected || manual_trigger)) {
             s_relay_active_until_ms = now_ms() + RELAY_TRIGGER_MS;
 
             update_stealth_token(); // Roll immediately
             s_burn_cooldown_until_ms = now_ms() + 2500;
+            g_manual_unlock_until_ms = 0;
             s_previous_token_valid_until_ms = 0;
             s_previous_challenge_valid_until_ms = 0;
 
