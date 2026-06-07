@@ -14,13 +14,21 @@ The system consists of two primary components:
 
 ---
 
-## 🔐 Cryptography & Security
+## 🔐 How It Works: High-Level Security
 
-DoorLink does not rely on standard BLE GATT connections, which are notoriously slow and unreliable in the background. Instead, it uses a stateless **Challenge-Response** mechanism over BLE Advertisements.
+Standard smart locks often rely on slow Bluetooth connections or send static passwords over the air, which hackers can easily intercept and reuse to open your door later (known as a "Replay Attack"). 
 
-* **Key Exchange:** Uses **ECDH (Elliptic-Curve Diffie-Hellman)** over the `SECP256R1` (NIST P-256) curve. The ESP32 and the App each generate their own public/private key pairs. During provisioning, the public keys are exchanged, allowing both devices to compute identical **Shared Secrets** without ever transmitting them over the air.
-* **Authentication:** The ESP32 broadcasts a random 8-byte challenge. The phone captures this, generates an **HMAC-SHA256** hash using the Shared Secret, User ID, and the Challenge, and broadcasts the truncated 15-byte response back to the ESP32.
-* **Anti-Replay Protection:** The ESP32 rotates its challenge nonce every 15 seconds. Once a challenge is successfully used to open the door, it is instantly "burned" (rotated) to prevent an attacker from capturing and reusing the broadcasted response packet.
+DoorLink completely avoids standard Bluetooth pairings. Instead, it uses a lightning-fast **Challenge-Response** mechanism. Think of it as a secret handshake where the required password changes every few seconds.
+
+Here is what happens behind the scenes:
+
+1. **The Shared Secret (Key Exchange):** During initial setup, your phone and the lock securely agree on a master "Shared Secret" using military-grade cryptography (NIST P-256 ECDH). This master secret is safely stored on both devices and is **never** transmitted over the air.
+2. **The Challenge (The Lock asks a question):** The lock constantly broadcasts a random mathematical puzzle (the "Challenge") to the surrounding area. It changes this puzzle every 15 seconds.
+3. **The Response (The Phone answers):** The app running in the background of your pocketed phone hears the puzzle. It uses the master Shared Secret to solve the puzzle (using an HMAC-SHA256 hash) and silently broadcasts the correct answer back.
+4. **Physical Intent (The Wave):** Just because your phone is near the door doesn't mean you want to go outside! The lock verifies your phone's answer and measures the signal strength. It then waits for you to wave your hand over the laser sensor, proving your intent to open the door.
+5. **Anti-Replay Protection (One-Time Use):** Once the door opens, that specific puzzle is instantly "burned". Even if a hacker was hiding in the bushes and recorded your phone's answer, playing it back to the door a minute later won't work because the lock has already moved on to a new puzzle.
+
+*(Note for developers: To bypass aggressive OS-level BLE duplicate filtering that prevents locked phones from seeing the same beacon twice, the ESP32 dynamically randomizes its own BLE MAC address every time the challenge rotates!)*
 
 ---
 
@@ -40,11 +48,6 @@ If the user wants to unlock the door without triggering the physical laser senso
 ---
 
 ## ⚙️ ESP32 Firmware
-
-### 1. BLE Scanner & Advertiser (`ble_scanner.c`)
-* Continuously advertises the 8-byte cryptographic challenge.
-* Passively scans for incoming claims from enrolled phones.
-* **MAC Rotation Trick:** To bypass aggressive OS-level BLE duplicate filtering (which prevents locked Android/iOS devices from seeing the same beacon twice), the ESP32 randomizes its own BLE MAC address every time the challenge rotates.
 
 ### 2. Main Logic & Intent Verification (`app_main.c`)
 Opening the door requires three conditions to be met simultaneously:
@@ -70,9 +73,8 @@ The ESP32 broadcasts a hidden Wi-Fi network (`DL_DOOR`). By connecting to this n
 4. The Admin provides the ESP32's Public Key back to the user to enter into their app. The Shared Secret is now established.
 
 ### 2. Auto-Unlock (Zero Interaction)
-1. User walks up to the door with their phone in their pocket.
-2. The phone's background service hears the ESP32's rotating challenge.
-3. The phone computes the HMAC response and broadcasts it.
-4. The ESP32 verifies the response and flags the user as `Authorized` and `Arrived`.
-5. The user waves their hand over the VL6180X laser sensor.
-6. The ESP32 triggers the relay, unlocking the door, and instantly rotates the challenge to prevent replay attacks.
+1. **Approach:** You walk up to the door with your phone locked in your pocket or bag.
+2. **Listen & Solve:** The phone silently hears the lock's current "puzzle" (challenge), solves it using its hidden key, and shouts the correct answer.
+3. **Verify:** The lock hears the correct answer and measures the signal strength to ensure you are standing right in front of the door (not 30 feet away).
+4. **Intent:** The lock arms itself. You wave your hand over the laser sensor to prove you actually want to open the door.
+5. **Unlock:** The door unlocks, and the lock immediately changes the puzzle so the same answer can never be used again.
