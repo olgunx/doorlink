@@ -62,6 +62,7 @@ class BeaconService : Service() {
     private var lastChallengeHex: String = ""
     private var activeChallengeBytes: ByteArray = ByteArray(0)
     private var activeResponseBytes: ByteArray = ByteArray(0)
+    private var currentServiceUuid: String = "0000fcd2-0000-1000-8000-00805f9b34fb"
     private val staticServiceUuid: ParcelUuid by lazy {
         ParcelUuid(Utils.uuidFrom16Bytes(hexStringToByteArray(STATIC_UUID_HEX)))
     }
@@ -102,7 +103,14 @@ class BeaconService : Service() {
             return START_NOT_STICKY
         }
 
-        val userIdHex = intent?.getStringExtra(EXTRA_USER_ID)?.trim().orEmpty()
+        var userIdHex = intent?.getStringExtra(EXTRA_USER_ID)?.trim().orEmpty()
+        if (userIdHex.startsWith("MANUAL_")) {
+            currentServiceUuid = "0000fcd3-0000-1000-8000-00805f9b34fb"
+            userIdHex = userIdHex.substring(7)
+        } else {
+            currentServiceUuid = "0000fcd2-0000-1000-8000-00805f9b34fb"
+        }
+
         if (userIdHex.isBlank()) {
             emitDebug("Missing credentials")
             stopSelf(startId)
@@ -125,6 +133,10 @@ class BeaconService : Service() {
 
         ensureBluetooth()
         startProximityScan()
+        
+        if (activeChallengeBytes.isNotEmpty() && activeResponseBytes.isNotEmpty()) {
+            advertiseResponse(activeChallengeBytes, activeResponseBytes, true)
+        }
         return START_STICKY
     }
 
@@ -196,6 +208,7 @@ class BeaconService : Service() {
             .setConnectable(false)
             .build()
 
+        val pUuid = ParcelUuid.fromString(currentServiceUuid)
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
@@ -203,7 +216,7 @@ class BeaconService : Service() {
             .build()
 
         val scanResponse = AdvertiseData.Builder()
-            .addManufacturerData(MANUFACTURER_ID_RESPONSE, payload)
+            .addServiceUuid(pUuid)
             .build()
 
         advertiseCallback = object : AdvertiseCallback() {
