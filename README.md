@@ -25,10 +25,29 @@ Here is what happens behind the scenes:
 1. **The Shared Secret (Key Exchange):** During initial setup, your phone and the lock securely agree on a master "Shared Secret" using military-grade cryptography (NIST P-256 ECDH). This master secret is safely stored on both devices and is **never** transmitted over the air.
 2. **The Challenge (The Lock asks a question):** The lock constantly broadcasts a random mathematical puzzle (the "Challenge") to the surrounding area. It changes this puzzle every 15 seconds.
 3. **The Response (The Phone answers):** The app running in the background of your pocketed phone hears the puzzle. It uses the master Shared Secret to solve the puzzle (using an HMAC-SHA256 hash) and silently broadcasts the correct answer back.
-4. **Physical Intent (The Wave):** Just because your phone is near the door doesn't mean you want to go outside! The lock verifies your phone's answer and measures the signal strength. It then waits for you to wave your hand over the laser sensor, proving your intent to open the door.
-5. **Anti-Replay Protection (One-Time Use):** Once the door opens, that specific puzzle is instantly "burned". Even if a hacker was hiding in the bushes and recorded your phone's answer, playing it back to the door a minute later won't work because the lock has already moved on to a new puzzle.
+4. **The Verification (The Lock checks the work):** The lock calculates the answer itself using the master Shared Secret. When it receives your phone's broadcast, it verifies a perfect match. It also measures the Bluetooth signal strength (RSSI) to ensure you are standing directly in front of the door, not just parked in the driveway.
+5. **Physical Intent (The Wave):** Just because you are authorized and nearby doesn't mean you want to go inside! The lock arms itself and waits for you to wave your hand over its laser distance sensor, proving your intent to enter.
+6. **Anti-Replay Protection (One-Time Use):** Once the door opens, that specific puzzle is instantly "burned". Even if a hacker was hiding in the bushes and recorded your phone's answer, playing it back to the door a minute later won't work because the lock has already moved on to a new puzzle.
 
 *(Note for developers: To bypass aggressive OS-level BLE duplicate filtering that prevents locked phones from seeing the same beacon twice, the ESP32 dynamically randomizes its own BLE MAC address every time the challenge rotates!)*
+
+### 🧑‍💻 Code Deep-Dive: Keys in Action
+
+If you look at the source code, here is exactly how the public and private keys are used to solve the "puzzle":
+
+**1. The Mobile App (`BeaconService.kt`)**
+When the Android app scans the BLE challenge, it runs the `computeResponse()` function:
+* It grabs the **App's Private Key** (stored securely on the phone).
+* It grabs the **ESP32's Public Key** (hardcoded for now as `ESP_PUBLIC_KEY_HEX`).
+* It uses Elliptic-Curve Diffie-Hellman (`KeyAgreement.getInstance("ECDH")`) to combine them into a `Shared Secret`. 
+* It then uses `HmacSHA256` to hash the `Shared Secret`, the `User ID`, and the `Challenge`, broadcasting the first 15 bytes back to the door.
+
+**2. The ESP32 Lock (`app_main.c`)**
+When the lock receives the broadcast, it runs the `compute_expected_response()` function:
+* It grabs the **ESP32's Private Key** (from internal `device_key.c`).
+* It looks up the **App's Public Key** tied to the User ID (from `enrollment_mgr.c`).
+* It uses mbedTLS (`mbedtls_ecdh_compute_shared()`) to combine them. Thanks to the math of ECDH, combining the *Lock's Private Key* and the *App's Public Key* results in the **exact same `Shared Secret`**.
+* It runs the same `HmacSHA256` hash on the Challenge. If its computed hash matches the one broadcasted by the phone, the door unlocks!
 
 ---
 
