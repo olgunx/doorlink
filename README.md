@@ -116,7 +116,7 @@ To transition DoorLink from a functional prototype into a mass-market, multi-ten
 - [ ] **Native OS Share Sheet Integration (Flutter):** Implement OS-level sharing receivers (`receive_sharing_intent` or `share_handler`) in the mobile app.
   - **Image Share Target:** Allow the admin to open a user-submitted QR code screenshot directly from WhatsApp, click "Share", select DoorLink, and have the app automatically parse the user ID and public key.
   - **Text Share Target:** Allow the admin to share encrypted invitation text/deep-links directly from WhatsApp into the app.
-- [ ] **Background Passive Sync:** Program the admin's app to silently queue newly approved residents. When the manager passes by the main building door, the app must passively connect to the ESP32 over a secure administrator BLE GATT characteristic and push the new credentials to `enrollment_mgr.c` within seconds.
+- [ ] **Background Passive Sync:** Program the admin's app to silently queue newly approved residents. When the manager passes by the main building door, when the app connects to the ESP32 over a secure administrator BLE GATT characteristic and push the new credentials to `enrollment_mgr.c` within seconds.
 
 ### 🔐 Cryptographic Offline Licensing & Time-Verification Architecture
 Because the device lacks internet access, a Real-Time Clock ($RTC$) chip, or a battery backup, implement a bulletproof asymmetrically signed license enforcement protocol:
