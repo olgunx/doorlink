@@ -105,7 +105,8 @@ The ESP32 broadcasts a hidden Wi-Fi network (`DL_DOOR`). By connecting to this n
 To transition DoorLink from a functional prototype into a mass-market, multi-tenant B2B/B2C product for Turkish apartments (*apartman*) and residential facilities, the following tasks must be completed:
 
 ### 🛠️ Hardware & Industrial Design Changes
-- [ ] **Split-Module Enclosure Design:** - **Main Controller Box:** House the ESP32, relay circuitry, and power terminal inside a secure, indoor-rated box installed safely inside the building lobby. It will only require a standard 12V DC adapter power entry.
+- [ ] **Split-Module Enclosure Design:**
+  - **Main Controller Box:** House the ESP32, relay circuitry, and power terminal inside a secure, indoor-rated box installed safely inside the building lobby. It will only require a standard 12V DC adapter power entry.
   - **External Sensor Block:** Create a tiny, ruggedized, weatherproof (IP65+) outdoor pod containing only the VL6180X Time-of-Flight sensor.
   - **Inter-Module Wiring:** Connect the main box and the outdoor sensor block via a robust, vandal-resistant 4-pin cable.
 - [ ] **Intercom (Diyafon) Parallel Integration:** Design the dry-contact relay output terminal to wire directly in parallel with existing building intercom systems (Audio, Netelsan, Mas, etc.) to trigger the 12V door strike (*kapı otomatiği*) without interfering with indoor flat-to-door buzzer pulses.
@@ -117,7 +118,25 @@ To transition DoorLink from a functional prototype into a mass-market, multi-ten
   - **Text Share Target:** Allow the admin to share encrypted invitation text/deep-links directly from WhatsApp into the app.
 - [ ] **Background Passive Sync:** Program the admin's app to silently queue newly approved residents. When the manager passes by the main building door, the app must passively connect to the ESP32 over a secure administrator BLE GATT characteristic and push the new credentials to `enrollment_mgr.c` within seconds.
 
+### 🔐 Cryptographic Offline Licensing & Time-Verification Architecture
+Because the device lacks internet access, a Real-Time Clock ($RTC$) chip, or a battery backup, implement a bulletproof asymmetrically signed license enforcement protocol:
+- [ ] **Hardware-Locked Activation Tokens:**
+  - **Unique Device Identification:** On initial setup, the Flutter app reads the ESP32's immutable 6-byte factory MAC address / Chip ID (e.g., `DL-A87F-99C2`).
+  - **License Generation (Vendor-Side):** The management board pays the annual fee and provides their Chip ID. The vendor uses an offline **Licensing Private Key** (Ed25519 or ECDSA) to sign a payload payload containing:
+    $$\text{Payload} = [\text{Chip ID}] + [\text{License Issue Date}] + [\text{License Expiry Date (Unix Timestamp)}]$$
+  - This outputs an alpha-numeric activation string (e.g., `X7R9-A2B1-K9LM-3P4Q`).
+- [ ] **On-Chip Decryption & Validation (ESP32-Side):**
+  - Embed the vendor’s public **Licensing Verification Key** inside the ESP32 firmware.
+  - When the admin pastes the token into the app, it is piped via BLE directly to the ESP32.
+  - The ESP32 decrypts the token, mathematically validates the vendor signature, and confirms the payload's `Chip ID` perfectly matches its own physical chip register. If copied to another building's lock, it triggers a critical hardware mismatch and rejects the operation.
+- [ ] **Crowdsourced Monotonically Increasing Time Engine (Anti-Tampering):**
+  - **Time Tracking without RTC:** Store a `Last_Known_Timestamp` variable in the ESP32 Non-Volatile Storage ($NVS$).
+  - **Passive Clock Injection:** Every single time an authorized resident or admin triggers the door lock via BLE, their mobile app securely transmits the phone's current Unix epoch timestamp as an auxiliary encrypted parameter.
+  - **Strict Monotonic Rule:** The ESP32 compares the incoming smartphone timestamp against the stored `Last_Known_Timestamp`. If the smartphone time is greater, the ESP32 advances its clock forward. If a malicious user sets their personal smartphone clock backward to trick the lock into an unexpired license window, the ESP32 detects that time is flowing backward and drops the update.
+  - **Expiration Check:** When the monotonically advanced `Last_Known_Timestamp` exceeds the `License Expiry Date` decrypted from the activation token, the ESP32 safely toggles into a locked administrative state until a new valid token is fed.
+- [ ] **Firmware Hardening:** Enable ESP32-C3 hardware-level **Secure Boot** to prevent side-channel JTAG flash modifications of the licensing conditions, and **Flash Encryption** to protect the local keys and user storage tables in raw memory.
+
 ### 📊 Market & Distribution Channel Alignment
 - [ ] **B2B Electrician Sales Channel Strategy:** Price the system to target local neighborhood electricians and building security installers. Ensure the installation requires no software configuration for the installer (Pure plug-and-play: 12V adapter in + 2 wires to the door lock strike button).
 - [ ] **Per-Household Cost Competitiveness:** Price the hardware unit between **3,500 TL – 5,500 TL**, positioning it as a highly economic alternative to cheap, cloneable RFID fobs (*göstergeç*). For a standard 20-unit apartment block, this drops the per-flat investment below the 300 TL cost of a single physical fob, while providing infinite, cost-free digital key issuance.
-- [ ] **Recurring Revenue Architecture:** Explore an optional micro-subscription model (e.g., small annual maintenance fee per household after year one) to fund ongoing mobile app development and background OS adaptation updates.
+- [ ] **Recurring Revenue Architecture:** Handle renewals strictly at the building-management level via the custom offline license activation framework, shielding individual tenants from individual microtransactions.
