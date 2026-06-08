@@ -97,3 +97,27 @@ The ESP32 broadcasts a hidden Wi-Fi network (`DL_DOOR`). By connecting to this n
 3. **Verify:** The lock hears the correct answer and measures the signal strength to ensure you are standing right in front of the door (not 30 feet away).
 4. **Intent:** The lock arms itself. You wave your hand over the laser sensor to prove you actually want to open the door.
 5. **Unlock:** The door unlocks, and the lock immediately changes the puzzle so the same answer can never be used again.
+
+---
+
+## 📝 TODO: Commercial & Architectural Roadmap (Türkiye Market Focus)
+
+To transition DoorLink from a functional prototype into a mass-market, multi-tenant B2B/B2C product for Turkish apartments (*apartman*) and residential facilities, the following tasks must be completed:
+
+### 🛠️ Hardware & Industrial Design Changes
+- [ ] **Split-Module Enclosure Design:** - **Main Controller Box:** House the ESP32, relay circuitry, and power terminal inside a secure, indoor-rated box installed safely inside the building lobby. It will only require a standard 12V DC adapter power entry.
+  - **External Sensor Block:** Create a tiny, ruggedized, weatherproof (IP65+) outdoor pod containing only the VL6180X Time-of-Flight sensor.
+  - **Inter-Module Wiring:** Connect the main box and the outdoor sensor block via a robust, vandal-resistant 4-pin cable.
+- [ ] **Intercom (Diyafon) Parallel Integration:** Design the dry-contact relay output terminal to wire directly in parallel with existing building intercom systems (Audio, Netelsan, Mas, etc.) to trigger the 12V door strike (*kapı otomatiği*) without interfering with indoor flat-to-door buzzer pulses.
+
+### 📱 Usability & Admin Onboarding Overhaul (Zero-Friction UX)
+- [ ] **Remove Web Console Dependency:** Phase out the local Wi-Fi Access Point (`web_console.c`) approach for user provisioning to fit non-technical building managers (*apartman yöneticisi*).
+- [ ] **Native OS Share Sheet Integration (Flutter):** Implement OS-level sharing receivers (`receive_sharing_intent` or `share_handler`) in the mobile app.
+  - **Image Share Target:** Allow the admin to open a user-submitted QR code screenshot directly from WhatsApp, click "Share", select DoorLink, and have the app automatically parse the user ID and public key.
+  - **Text Share Target:** Allow the admin to share encrypted invitation text/deep-links directly from WhatsApp into the app.
+- [ ] **Background Passive Sync:** Program the admin's app to silently queue newly approved residents. When the manager passes by the main building door, the app must passively connect to the ESP32 over a secure administrator BLE GATT characteristic and push the new credentials to `enrollment_mgr.c` within seconds.
+
+### 📊 Market & Distribution Channel Alignment
+- [ ] **B2B Electrician Sales Channel Strategy:** Price the system to target local neighborhood electricians and building security installers. Ensure the installation requires no software configuration for the installer (Pure plug-and-play: 12V adapter in + 2 wires to the door lock strike button).
+- [ ] **Per-Household Cost Competitiveness:** Price the hardware unit between **3,500 TL – 5,500 TL**, positioning it as a highly economic alternative to cheap, cloneable RFID fobs (*göstergeç*). For a standard 20-unit apartment block, this drops the per-flat investment below the 300 TL cost of a single physical fob, while providing infinite, cost-free digital key issuance.
+- [ ] **Recurring Revenue Architecture:** Explore an optional micro-subscription model (e.g., small annual maintenance fee per household after year one) to fund ongoing mobile app development and background OS adaptation updates.
