@@ -3,17 +3,14 @@
 #include "device_key.h"
 #include "vl6180x.h"
 #include "enrollment_mgr.h"
-#include "web_console.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_check.h"
-#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "esp_system.h"
-#include "esp_wifi.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -59,9 +56,6 @@ static bool s_enrolled_pubkey_logged;
 static bool s_device_pubkey_logged;
 
 static nvs_handle_t s_nvs = 0;
-static uint8_t s_vendor_ie_buf_a[sizeof(vendor_ie_data_t) + LIGHTHOUSE_TOKEN_LEN] __attribute__((aligned(4)));
-static uint8_t s_vendor_ie_buf_b[sizeof(vendor_ie_data_t) + LIGHTHOUSE_TOKEN_LEN] __attribute__((aligned(4)));
-static uint8_t *s_vendor_ie_active = NULL;
 static QueueHandle_t s_claim_queue = NULL;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
@@ -98,35 +92,6 @@ static void format_uptime(char *buf, size_t buf_size, uint32_t ms)
 }
 static void set_relay(bool on) { gpio_set_level(RELAY_GPIO, RELAY_ACTIVE_LOW ? !on : on); }
 
-static esp_err_t update_hidden_ap_token_ie(void)
-{
-    // Safely remove the currently active IE before injecting the new one
-    if (s_vendor_ie_active != NULL) {
-        esp_wifi_set_vendor_ie(false, WIFI_VND_IE_TYPE_BEACON, WIFI_VND_IE_ID_0, s_vendor_ie_active);
-        esp_wifi_set_vendor_ie(false, WIFI_VND_IE_TYPE_PROBE_RESP, WIFI_VND_IE_ID_0, s_vendor_ie_active);
-    }
-
-    uint8_t *next_buf = (s_vendor_ie_active == s_vendor_ie_buf_a) ? s_vendor_ie_buf_b : s_vendor_ie_buf_a;
-    vendor_ie_data_t *v = (vendor_ie_data_t *)next_buf;
-    v->element_id = WIFI_VENDOR_IE_ELEMENT_ID;
-    // Stealth Token Injection 6 bytes payload
-    v->length = 4 + 6;
-    // Use Apple OUI (00 17 F2) to bypass filters without conflicting with WPA2 IEs
-    v->vendor_oui[0] = 0x00;
-    v->vendor_oui[1] = 0x17;
-    v->vendor_oui[2] = 0xF2;
-    v->vendor_oui_type = 0x42;
-    memcpy(v->payload, s_active_token, 6);
-    esp_err_t err = esp_wifi_set_vendor_ie(true, WIFI_VND_IE_TYPE_BEACON, WIFI_VND_IE_ID_0, v);
-    esp_err_t err2 = esp_wifi_set_vendor_ie(true, WIFI_VND_IE_TYPE_PROBE_RESP, WIFI_VND_IE_ID_0, v);
-    if (err != ESP_OK || err2 != ESP_OK) {
-        ESP_LOGW(TAG, "enable vendor IE failed: %s", esp_err_to_name(err));
-    } else {
-        s_vendor_ie_active = next_buf;
-    }
-    return err;
-}
-
 static void update_stealth_token(void)
 {
     memcpy(s_previous_token, s_active_token, LIGHTHOUSE_TOKEN_LEN);
@@ -147,14 +112,7 @@ static void update_stealth_token(void)
     s_authorized = false;
     s_auth_window_started_ms = 0;
 
-    esp_err_t err = update_hidden_ap_token_ie();
     ble_scanner_set_challenge_beacon(s_active_challenge);
-    if (err == ESP_ERR_NOT_SUPPORTED) {
-        return;
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Stealth IE injection update failed");
-    }
 }
 
 static int ecdh_rng_wrapper(void *ctx, unsigned char *buf, size_t len)
@@ -380,31 +338,6 @@ static void token_rotate_task(void *arg)
     }
 }
 
-static esp_err_t init_wifi_hidden_ap(void)
-{
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "esp_event_loop_create_default");
-    esp_netif_create_default_wifi_ap();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "esp_wifi_init");
-
-    wifi_config_t ap = {0};
-    memcpy(ap.ap.ssid, "DL_DOOR", 7);
-    ap.ap.ssid_len = 7;
-    memcpy(ap.ap.password, "doorl1223", 9);
-    ap.ap.channel = 1;
-    ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    ap.ap.ssid_hidden = 0;
-    ap.ap.max_connection = 1;
-    ap.ap.beacon_interval = 100;
-
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "esp_wifi_set_mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "esp_wifi_set_config");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start");
-
-    return ESP_OK;
-}
-
 static esp_err_t init_vl6180x_bus(void)
 {
     i2c_config_t i2c_conf = {
@@ -507,9 +440,7 @@ void app_main(void)
     set_relay(false);
 
     ESP_ERROR_CHECK(init_vl6180x_bus());
-    ESP_ERROR_CHECK(init_wifi_hidden_ap());
     update_stealth_token(); // Initialize the current challenge beacon
-    ESP_ERROR_CHECK(web_console_init());
     ESP_ERROR_CHECK(ble_scanner_set_static_uuid_beacon(STATIC_UUID));
     ble_scanner_set_claim_detected_cb(claim_detected);
     ESP_ERROR_CHECK(ble_scanner_init());

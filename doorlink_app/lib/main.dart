@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:math';
-import 'dart:io' show Platform, HttpClient;
-import 'dart:convert';
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 void main() {
   runApp(const MyApp());
@@ -41,13 +42,18 @@ class _MainAppScreenState extends State<MainAppScreen> {
   String _userId = "";
   String _espPublicKey = "";
   String _appPublicKey = "";
+  String _chipId = "";
   late TextEditingController _userIdController;
   late TextEditingController _espPubKeyController;
   late TextEditingController _pubKeyController;
+  late TextEditingController _chipIdController;
 
   // Engine State
   String _status = 'Initializing...';
   final List<String> _logs = [];
+  final List<Map<String, String>> _pendingUsers = [];
+  
+  late StreamSubscription _intentDataStreamSubscription;
 
   String _formatTimestamp(DateTime time) {
     final local = time.toLocal();
@@ -73,11 +79,74 @@ class _MainAppScreenState extends State<MainAppScreen> {
     _userIdController = TextEditingController(text: _userId);
     _espPubKeyController = TextEditingController(text: _espPublicKey);
     _pubKeyController = TextEditingController(text: _appPublicKey);
+    _chipIdController = TextEditingController(text: _chipId);
     _status = 'Loading credentials...';
     platform.setMethodCallHandler(_handleNativeCall);
     _loadOrCreateCredentials().then((_) {
       if (_isActive) _initListening();
+      _setupShareIntentListener();
     });
+  }
+
+  void _setupShareIntentListener() {
+    // 1. Listen for intent payloads shared while the app is already in memory
+    _intentDataStreamSubscription = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
+      if (value.isNotEmpty && value.first.type == SharedMediaType.text) {
+        _handleSharedText(value.first.path); // receive_sharing_intent puts text in .path
+      } else if (value.isNotEmpty && value.first.type == SharedMediaType.image) {
+        _addLog('Received Image intent: ${value.first.path}');
+      }
+    }, onError: (err) {
+      _addLog("Intent stream error: $err");
+    });
+
+    // 2. Listen for intent payloads shared when app is completely closed
+    ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
+      if (value.isNotEmpty && value.first.type == SharedMediaType.text) {
+        _handleSharedText(value.first.path);
+      } else if (value.isNotEmpty && value.first.type == SharedMediaType.image) {
+        _addLog('Received initial Image intent: ${value.first.path}');
+      }
+    });
+  }
+
+  void _handleSharedText(String text) {
+    _addLog('Received shared text:\n$text');
+    
+    // Regex to extract Fingerprint (User ID) and App Public Key
+    final userIdMatch = RegExp(r'Fingerprint \(User ID\):\s*([a-fA-F0-9]+)').firstMatch(text);
+    final pubKeyMatch = RegExp(r'App Public Key \(raw hex\):\s*([a-fA-F0-9]+)').firstMatch(text);
+
+    if (userIdMatch != null && pubKeyMatch != null) {
+      final parsedUserId = userIdMatch.group(1)!;
+      final parsedPubKey = pubKeyMatch.group(1)!;
+
+      _addLog('Successfully parsed User ID: $parsedUserId');
+      _addLog('Successfully parsed Public Key.');
+
+      setState(() {
+        _pendingUsers.add({
+          'userId': parsedUserId,
+          'pubKey': parsedPubKey,
+        });
+        _currentIndex = 1; // Auto-switch to the new Admin tab
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Parsed user $parsedUserId!'), backgroundColor: Colors.green),
+        );
+      }
+    } else {
+      _addLog('Failed to parse User ID or Public Key from shared text.');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to parse DoorLink invite text.'), backgroundColor: Colors.red),
+        );
+      }
+    }
+
+    ReceiveSharingIntent.instance.reset(); // clear the intent so it doesn't trigger again
   }
 
   Future<void> _handleNativeCall(MethodCall call) async {
@@ -148,6 +217,8 @@ class _MainAppScreenState extends State<MainAppScreen> {
     _userIdController.dispose();
     _espPubKeyController.dispose();
     _pubKeyController.dispose();
+    _chipIdController.dispose();
+    _intentDataStreamSubscription.cancel();
     super.dispose();
   }
 
@@ -246,18 +317,6 @@ class _MainAppScreenState extends State<MainAppScreen> {
 
   Future<void> _manualUnlock() async {
     _addLog('Manual unlock requested...');
-    try {
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 2);
-      final request = await client.postUrl(Uri.parse('http://192.168.4.1/api/unlock'));
-      final response = await request.close();
-      if (response.statusCode == 200) {
-        _addLog('Manual unlock signal sent via Wi-Fi!');
-        return;
-      }
-    } catch (e) {
-      _addLog('Wi-Fi manual unlock failed. Trying BLE fallback...');
-    }
     
     try {
       await platform.invokeMethod('startBackgroundService', {
@@ -308,37 +367,154 @@ class _MainAppScreenState extends State<MainAppScreen> {
     }
   }
 
-  Future<void> _fetchPubKeyFromAP() async {
-    _addLog('Attempting to fetch Lock Public Key from AP...');
-    setState(() => _status = 'Fetching key from AP...');
+  Future<void> _fetchPubKeyViaBle() async {
+    _addLog('Attempting to fetch Lock Public Key via BLE...');
+    setState(() => _status = 'Scanning for lock...');
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Scanning for DoorLink lock to pair...')),
+      );
+    }
+
+    bool wasActive = _isActive;
+    if (wasActive) {
+      _addLog('Pausing background service for reliable BLE GATT...');
+      await _stopListening();
+      await Future.delayed(const Duration(milliseconds: 1500)); // Let radio and service fully stop
+    }
+
     try {
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 3);
-      final request = await client.getUrl(Uri.parse('http://192.168.4.1/api/pubkey'));
-      final response = await request.close();
-      if (response.statusCode == 200) {
-        final responseBody = await response.transform(utf8.decoder).join();
-        final json = jsonDecode(responseBody);
-        final fetchedKey = json['pubkey']?.toString() ?? '';
-        if (fetchedKey.isNotEmpty) {
-          setState(() {
-            _espPublicKey = fetchedKey;
-            _espPubKeyController.text = fetchedKey;
-            _status = 'Successfully fetched Lock Public Key';
-          });
-          _addLog('Successfully fetched Lock Public Key!');
-          await platform.invokeMethod('saveStoredCredentials', {
-            'userId': _userId,
-            'espPubKey': _espPublicKey,
-          });
+      bool found = false;
+      BluetoothDevice? targetDevice;
+
+      var subscription = FlutterBluePlus.scanResults.listen((results) {
+        for (ScanResult r in results) {
+          if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
+            targetDevice = r.device;
+            found = true;
+            FlutterBluePlus.stopScan();
+            break;
+          }
+        }
+      });
+
+      await FlutterBluePlus.startScan(
+        withServices: [Guid("0000fcd2-0000-1000-8000-00805f9b34fb")],
+        timeout: const Duration(seconds: 5),
+      );
+
+      await FlutterBluePlus.isScanning.where((val) => val == false).first;
+      subscription.cancel();
+
+      if (!found) {
+         for (ScanResult r in FlutterBluePlus.lastScanResults) {
+            if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
+               targetDevice = r.device;
+               found = true;
+               break;
+            }
+         }
+      }
+
+      if (targetDevice == null) {
+        throw Exception('No DoorLink locks found nearby.');
+      }
+
+      if (Platform.isAndroid) {
+         await Future.delayed(const Duration(milliseconds: 500));
+      }
+
+      _addLog('Found lock: ${targetDevice!.remoteId}. Connecting...');
+      
+      try {
+        await targetDevice!.connect(timeout: const Duration(seconds: 5));
+      } catch (e) {
+        _addLog('First connect attempt failed. Retrying...');
+        await targetDevice!.disconnect();
+        await Future.delayed(const Duration(milliseconds: 500));
+        await targetDevice!.connect(timeout: const Duration(seconds: 10));
+      }
+
+      _addLog('Discovering services...');
+      final services = await targetDevice!.discoverServices();
+      
+      BluetoothService? adminService;
+      for (var s in services) {
+        if (s.uuid == Guid("0000fcd4-0000-1000-8000-00805f9b34fb")) {
+          adminService = s;
+          break;
+        }
+      }
+
+      if (adminService == null) {
+        await targetDevice!.disconnect();
+        throw Exception('Admin Service (FCD4) not found.');
+      }
+
+      BluetoothCharacteristic? pubKeyChar;
+      BluetoothCharacteristic? chipIdChar;
+      for (var c in adminService.characteristics) {
+        if (c.uuid == Guid("0000fcd7-0000-1000-8000-00805f9b34fb")) {
+          pubKeyChar = c;
+        } else if (c.uuid == Guid("0000fcd6-0000-1000-8000-00805f9b34fb")) {
+          chipIdChar = c;
+        }
+      }
+
+      if (pubKeyChar == null) {
+        await targetDevice!.disconnect();
+        throw Exception('PubKey Characteristic (FCD7) not found.');
+      }
+      if (chipIdChar == null) {
+        await targetDevice!.disconnect();
+        throw Exception('Chip ID Characteristic (FCD6) not found.');
+      }
+
+      _addLog('Reading Public Key and Chip ID via BLE...');
+      final value = await pubKeyChar.read();
+      final chipValue = await chipIdChar.read();
+      final fetchedKey = value.map((e) => e.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
+      final fetchedChipId = chipValue.map((e) => e.toRadixString(16).padLeft(2, '0')).join(':').toUpperCase();
+      _addLog('Key read successfully.');
+
+      await targetDevice!.disconnect();
+
+      if (fetchedKey.isNotEmpty && fetchedKey.length == 130) {
+        setState(() {
+          _espPublicKey = fetchedKey;
+          _espPubKeyController.text = fetchedKey;
+          _chipId = fetchedChipId;
+          _chipIdController.text = fetchedChipId;
+          _status = 'Successfully fetched Lock Public Key';
+        });
+        _addLog('Successfully paired with lock!');
+        await platform.invokeMethod('saveStoredCredentials', {
+          'userId': _userId,
+          'espPubKey': _espPublicKey,
+        });
+        
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Successfully paired with DoorLink lock!'), backgroundColor: Colors.green),
+          );
         }
       } else {
-        setState(() => _status = 'Failed to fetch key (HTTP ${response.statusCode})');
-        _addLog('HTTP error ${response.statusCode}');
+        throw Exception('Invalid key received: $fetchedKey');
       }
     } catch (e) {
-      setState(() => _status = 'Not connected to DL_DOOR AP?');
-      _addLog('Fetch failed: $e');
+      setState(() => _status = 'BLE Fetch failed');
+      _addLog('BLE Fetch failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to pair: $e'), backgroundColor: Colors.red),
+        );
+      }
+    } finally {
+      if (wasActive) {
+        _addLog('Resuming background service...');
+        await _initListening();
+      }
     }
   }
 
@@ -381,6 +557,182 @@ class _MainAppScreenState extends State<MainAppScreen> {
     );
   }
 
+  Future<void> _syncUserViaBle(String userIdHex, String pubKeyHex) async {
+    setState(() => _status = 'Admin Sync: Scanning...');
+    _addLog('Starting BLE Admin Sync for $userIdHex');
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Scanning for DoorLink lock...')),
+      );
+    }
+
+    bool wasActive = _isActive;
+    if (wasActive) {
+      _addLog('Pausing background service for reliable BLE GATT...');
+      await _stopListening();
+      await Future.delayed(const Duration(milliseconds: 1500)); // Let radio and service fully stop
+    }
+
+    try {
+      List<int> hexToBytes(String hex) {
+        final clean = hex.trim().toLowerCase();
+        return List.generate(clean.length ~/ 2, (i) => int.parse(clean.substring(i * 2, i * 2 + 2), radix: 16));
+      }
+
+      final userIdBytes = hexToBytes(userIdHex);
+      final pubKeyBytes = hexToBytes(pubKeyHex);
+      final payload = [...userIdBytes, ...pubKeyBytes];
+
+      // 1. Scan for the lock
+      bool found = false;
+      BluetoothDevice? targetDevice;
+
+      var subscription = FlutterBluePlus.scanResults.listen((results) {
+        for (ScanResult r in results) {
+          if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
+            targetDevice = r.device;
+            found = true;
+            FlutterBluePlus.stopScan();
+            break;
+          }
+        }
+      });
+
+      await FlutterBluePlus.startScan(
+        withServices: [Guid("0000fcd2-0000-1000-8000-00805f9b34fb")],
+        timeout: const Duration(seconds: 5),
+      );
+
+      await FlutterBluePlus.isScanning.where((val) => val == false).first;
+      subscription.cancel();
+
+      if (!found) {
+         for (ScanResult r in FlutterBluePlus.lastScanResults) {
+            if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
+               targetDevice = r.device;
+               found = true;
+               break;
+            }
+         }
+      }
+
+      if (targetDevice == null) {
+        throw Exception('No DoorLink locks found nearby.');
+      }
+
+      // Give Android's BLE stack a brief moment to settle after scanning
+      if (Platform.isAndroid) {
+         await Future.delayed(const Duration(milliseconds: 500));
+      }
+
+      _addLog('Found lock: ${targetDevice!.remoteId}. Connecting...');
+      
+      // 2. Connect
+      try {
+        await targetDevice!.connect(timeout: const Duration(seconds: 5));
+      } catch (e) {
+        _addLog('First connect attempt failed. Retrying...');
+        await targetDevice!.disconnect(); // Clear any hung Android OS states
+        await Future.delayed(const Duration(milliseconds: 500));
+        await targetDevice!.connect(timeout: const Duration(seconds: 10));
+      }
+
+      // 3. Discover Services
+      _addLog('Discovering services...');
+      final services = await targetDevice!.discoverServices();
+      
+      BluetoothService? adminService;
+      for (var s in services) {
+        if (s.uuid == Guid("0000fcd4-0000-1000-8000-00805f9b34fb")) {
+          adminService = s;
+          break;
+        }
+      }
+
+      if (adminService == null) {
+        await targetDevice!.disconnect();
+        throw Exception('Admin Sync Service (FCD4) not found.');
+      }
+
+      BluetoothCharacteristic? syncChar;
+      for (var c in adminService.characteristics) {
+        if (c.uuid == Guid("0000fcd5-0000-1000-8000-00805f9b34fb")) {
+          syncChar = c;
+          break;
+        }
+      }
+
+      if (syncChar == null) {
+        await targetDevice!.disconnect();
+        throw Exception('Admin Sync Characteristic (FCD5) not found.');
+      }
+
+      // 4. Write Payload
+      _addLog('Writing 69-byte payload...');
+      if (Platform.isAndroid) {
+         await targetDevice!.requestMtu(128); // Ensure we can send all 69 bytes at once
+      }
+      await syncChar.write(payload, withoutResponse: false);
+      _addLog('Payload written successfully!');
+
+      // 5. Disconnect
+      await targetDevice!.disconnect();
+
+      // 6. Update UI
+      setState(() {
+        _pendingUsers.removeWhere((u) => u['userId'] == userIdHex);
+        _status = 'Admin Sync: Success!';
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Successfully synced $userIdHex!'), backgroundColor: Colors.green),
+        );
+      }
+
+    } catch (e) {
+      _addLog('Admin Sync failed: $e');
+      setState(() => _status = 'Admin Sync: Failed');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Sync failed: $e'), backgroundColor: Colors.red),
+        );
+      }
+    } finally {
+      if (wasActive) {
+        _addLog('Resuming background service...');
+        await _initListening();
+      }
+    }
+  }
+
+  Widget _buildAdminScreen() {
+    if (_pendingUsers.isEmpty) {
+      return const Center(
+        child: Text('No pending users.\nShare a code from WhatsApp to add one.', textAlign: TextAlign.center),
+      );
+    }
+    return ListView.builder(
+      itemCount: _pendingUsers.length,
+      itemBuilder: (context, index) {
+        final user = _pendingUsers[index];
+        return Card(
+          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: ListTile(
+            leading: const Icon(Icons.person_add, color: Colors.blueGrey, size: 36),
+            title: Text('User ID: ${user['userId']}'),
+            subtitle: const Text('Tap icon to sync to lock via BLE'),
+            trailing: IconButton(
+              icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
+              onPressed: () => _syncUserViaBle(user['userId']!, user['pubKey']!),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildDiagnosticsScreen() {
     return Padding(
       padding: const EdgeInsets.all(16.0),
@@ -412,7 +764,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
   }
 
   Widget _buildSettingsScreen() {
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(16.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -444,12 +796,22 @@ class _MainAppScreenState extends State<MainAppScreen> {
             },
           ),
           const SizedBox(height: 12),
+          TextField(
+            controller: _chipIdController,
+            readOnly: true,
+            decoration: const InputDecoration(
+              labelText: 'Lock Hardware Chip ID',
+              border: OutlineInputBorder(),
+              helperText: 'Provide this to the vendor to generate a license.',
+            ),
+          ),
+          const SizedBox(height: 12),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
-              onPressed: _fetchPubKeyFromAP,
-              icon: const Icon(Icons.wifi),
-              label: const Text('Pair with Lock (Fetch Key from AP)'),
+              onPressed: _fetchPubKeyViaBle,
+              icon: const Icon(Icons.bluetooth),
+              label: const Text('Pair with Lock (Fetch Key via BLE)'),
             ),
           ),
           const SizedBox(height: 20),
@@ -509,6 +871,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
   Widget build(BuildContext context) {
     final List<Widget> pages = [
       _buildMainScreen(),
+      _buildAdminScreen(),
       _buildDiagnosticsScreen(),
       _buildSettingsScreen(),
     ];
@@ -521,6 +884,9 @@ class _MainAppScreenState extends State<MainAppScreen> {
       body: pages[_currentIndex],
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _currentIndex,
+        type: BottomNavigationBarType.fixed,
+        selectedItemColor: Colors.green.shade700,
+        unselectedItemColor: Colors.grey.shade600,
         onTap: (index) {
           setState(() {
             _currentIndex = index;
@@ -528,6 +894,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
         },
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home), label: 'Main'),
+          BottomNavigationBarItem(icon: Icon(Icons.admin_panel_settings), label: 'Admin'),
           BottomNavigationBarItem(icon: Icon(Icons.monitor_heart), label: 'Diagnostics'),
           BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Settings'),
         ],

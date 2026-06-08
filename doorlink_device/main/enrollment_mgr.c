@@ -97,6 +97,8 @@ esp_err_t enrollment_mgr_add_device(const uint8_t *user_id, const uint8_t *pubke
             if (err == ESP_OK) {
                 nvs_commit(s_handle);
                 update_cache();
+                ESP_LOGI(TAG, "Updated existing device slot for user %02X%02X%02X%02X",
+                         user_id[0], user_id[1], user_id[2], user_id[3]);
             }
             return err;
         }
@@ -115,6 +117,8 @@ esp_err_t enrollment_mgr_add_device(const uint8_t *user_id, const uint8_t *pubke
     if (err == ESP_OK) {
         nvs_commit(s_handle);
         update_cache();
+        ESP_LOGI(TAG, "Enrolled new device for user %02X%02X%02X%02X",
+                 user_id[0], user_id[1], user_id[2], user_id[3]);
     }
     return err;
 }

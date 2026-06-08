@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define BLE_SCAN_INTERVAL_UNITS      0x0050  /* 50 ms, 0.625 ms units */
+#define BLE_SCAN_INTERVAL_UNITS      0x00A0  /* 100 ms, 0.625 ms units */
 #define BLE_SCAN_WINDOW_UNITS        0x0030  /* 30 ms, 0.625 ms units (gives Wi-Fi airtime) */
 #define BLE_SCAN_ACTIVE              0
 #define BLE_SCAN_FILTER_DUPLICATES   0

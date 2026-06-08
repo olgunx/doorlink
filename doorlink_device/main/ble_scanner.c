@@ -4,6 +4,7 @@
 
 #include "device_key.h"
 #include "config.h"
+#include "enrollment_mgr.h"
 #include "esp_log.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
@@ -11,6 +12,8 @@
 #include "nimble/nimble_port_freertos.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "esp_mac.h"
 
 static const char *TAG = "ble_scanner";
 static uint8_t s_own_addr_type;
@@ -23,6 +26,94 @@ static volatile uint32_t s_claim_count;
 static volatile bool s_mac_rotation_pending = false;
 static ble_uuid16_t s_static_uuid16 = BLE_UUID16_INIT(0xFCD2);
 static bool s_host_synced = false;
+
+// --- Admin Passive Sync GATT Server ---
+static int admin_sync_access(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        // Expecting 69 bytes: 4 bytes User ID + 65 bytes App Public Key
+        if (len >= 69) {
+            uint8_t buf[128];
+            int copy_len = len > sizeof(buf) ? sizeof(buf) : len;
+            // ble_hs_mbuf_to_flat safely flattens fragmented MTU packets
+            if (ble_hs_mbuf_to_flat(ctxt->om, buf, copy_len, NULL) == 0) {
+                // TODO: In production, enforce Vendor Licensing Signatures here!
+                uint8_t *user_id = buf;
+                uint8_t *pubkey = buf + 4;
+                
+                ESP_LOGI(TAG, "GATT Admin Sync Payload received! Enrolling...");
+                esp_err_t err = enrollment_mgr_add_device(user_id, pubkey);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "Admin Sync: Successfully enrolled user.");
+                } else {
+                    ESP_LOGE(TAG, "Admin Sync: Enrollment failed: %s", esp_err_to_name(err));
+                }
+            }
+        }
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// --- Admin Chip ID Read ---
+static int admin_chip_id_access(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        uint8_t mac[6] = {0};
+        esp_efuse_mac_get_default(mac); // Get the immutable factory hardware MAC
+        int rc = os_mbuf_append(ctxt->om, mac, sizeof(mac));
+        return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// --- Admin PubKey Read ---
+static int admin_pubkey_access(uint16_t conn_handle, uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        const uint8_t *pubkey = device_key_get_public();
+        if (pubkey != NULL) {
+            int rc = os_mbuf_append(ctxt->om, pubkey, DEVICE_KEY_PUB_LEN);
+            return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const ble_uuid16_t admin_svc_uuid = BLE_UUID16_INIT(0xFCD4);
+static const ble_uuid16_t admin_chr_uuid = BLE_UUID16_INIT(0xFCD5);
+static const ble_uuid16_t admin_chip_id_uuid = BLE_UUID16_INIT(0xFCD6);
+static const ble_uuid16_t admin_pubkey_uuid = BLE_UUID16_INIT(0xFCD7);
+
+static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &admin_svc_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = &admin_chr_uuid.u,
+                .access_cb = admin_sync_access,
+                .flags = BLE_GATT_CHR_F_WRITE,
+            },
+            {
+                .uuid = &admin_chip_id_uuid.u,
+                .access_cb = admin_chip_id_access,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = &admin_pubkey_uuid.u,
+                .access_cb = admin_pubkey_access,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            { 0 }
+        }
+    },
+    { 0 }
+};
 
 #define RADIO_STATE_SCANNING    (1 << 0)
 #define RADIO_STATE_ADVERTISING (1 << 1)
@@ -163,6 +254,16 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg)
             start_adv();
         }
         return 0;
+    case BLE_GAP_EVENT_CONNECT:
+        ESP_LOGI(TAG, "BLE connected status=%d", event->connect.status);
+        if (event->connect.status != 0) {
+            start_adv();
+        }
+        return 0;
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "BLE disconnected reason=%d", event->disconnect.reason);
+        start_adv();
+        return 0;
     default:
         return 0;
     }
@@ -217,8 +318,10 @@ static void start_adv(void)
 
 
     struct ble_gap_adv_params adv_params = {
-        .conn_mode = BLE_GAP_CONN_MODE_NON,
-        .disc_mode = BLE_GAP_DISC_MODE_NON,
+        .conn_mode = BLE_GAP_CONN_MODE_UND,
+        .disc_mode = BLE_GAP_DISC_MODE_GEN,
+        .itvl_min = 0x00A0, /* 100 ms */
+        .itvl_max = 0x00C0, /* 120 ms */
     };
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_cb, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
@@ -287,6 +390,11 @@ esp_err_t ble_scanner_init(void)
     if (err != ESP_OK) {
         return err;
     }
+
+    // Register our custom GATT services before starting NimBLE host
+    ble_gatts_count_cfg(gatt_svr_svcs);
+    ble_gatts_add_svcs(gatt_svr_svcs);
+
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
     return ESP_OK;
