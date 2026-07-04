@@ -52,6 +52,10 @@ class _MainAppScreenState extends State<MainAppScreen> {
   String _status = 'Initializing...';
   final List<String> _logs = [];
   final List<Map<String, String>> _pendingUsers = [];
+  List<String> _enrolledUsers = [];
+  String _lockRelayStatus = "Unknown";
+  String _lockSensorStatus = "Unknown";
+  bool _isAdminLoading = false;
   
   late StreamSubscription _intentDataStreamSubscription;
 
@@ -367,6 +371,56 @@ class _MainAppScreenState extends State<MainAppScreen> {
     }
   }
 
+  Future<BluetoothDevice> _scanAndConnectToLock() async {
+    _addLog('Scanning for live Lock...');
+    
+    final completer = Completer<BluetoothDevice>();
+    final scanStartTime = DateTime.now().subtract(const Duration(seconds: 1));
+    
+    final subscription = FlutterBluePlus.scanResults.listen((results) {
+      for (var r in results) {
+        // Ensure we only pick a live advertisement, not a cached one from the background service
+        if (r.timeStamp.isAfter(scanStartTime)) {
+          if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
+            if (!completer.isCompleted) {
+              completer.complete(r.device);
+            }
+            break;
+          }
+        }
+      }
+    });
+
+    await FlutterBluePlus.startScan(
+      withServices: [Guid("0000fcd2-0000-1000-8000-00805f9b34fb")],
+      timeout: const Duration(seconds: 5),
+    );
+
+    try {
+      // Snap the connection the instant the Completer resolves the live MAC
+      final targetDevice = await completer.future.timeout(const Duration(seconds: 5));
+      await FlutterBluePlus.stopScan();
+      subscription.cancel();
+
+      if (Platform.isAndroid) await Future.delayed(const Duration(milliseconds: 300));
+      _addLog('Found live lock: ${targetDevice.remoteId}. Connecting...');
+      
+      try {
+        await targetDevice.connect(timeout: const Duration(seconds: 5));
+      } catch (e) {
+        _addLog('First connect attempt failed. Retrying...');
+        await targetDevice.disconnect();
+        await Future.delayed(const Duration(milliseconds: 300));
+        await targetDevice.connect(timeout: const Duration(seconds: 8));
+      }
+      return targetDevice;
+    } catch (e) {
+      await FlutterBluePlus.stopScan();
+      subscription.cancel();
+      throw Exception('No active DoorLink locks found nearby.');
+    }
+  }
+
   Future<void> _fetchPubKeyViaBle() async {
     _addLog('Attempting to fetch Lock Public Key via BLE...');
     setState(() => _status = 'Scanning for lock...');
@@ -385,59 +439,10 @@ class _MainAppScreenState extends State<MainAppScreen> {
     }
 
     try {
-      bool found = false;
-      BluetoothDevice? targetDevice;
-
-      var subscription = FlutterBluePlus.scanResults.listen((results) {
-        for (ScanResult r in results) {
-          if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
-            targetDevice = r.device;
-            found = true;
-            FlutterBluePlus.stopScan();
-            break;
-          }
-        }
-      });
-
-      await FlutterBluePlus.startScan(
-        withServices: [Guid("0000fcd2-0000-1000-8000-00805f9b34fb")],
-        timeout: const Duration(seconds: 5),
-      );
-
-      await FlutterBluePlus.isScanning.where((val) => val == false).first;
-      subscription.cancel();
-
-      if (!found) {
-         for (ScanResult r in FlutterBluePlus.lastScanResults) {
-            if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
-               targetDevice = r.device;
-               found = true;
-               break;
-            }
-         }
-      }
-
-      if (targetDevice == null) {
-        throw Exception('No DoorLink locks found nearby.');
-      }
-
-      if (Platform.isAndroid) {
-         await Future.delayed(const Duration(milliseconds: 500));
-      }
-
-      _addLog('Found lock: ${targetDevice!.remoteId}. Connecting...');
-      
-      try {
-        await targetDevice!.connect(timeout: const Duration(seconds: 5));
-      } catch (e) {
-        _addLog('First connect attempt failed. Retrying...');
-        await targetDevice!.disconnect();
-        await Future.delayed(const Duration(milliseconds: 500));
-        await targetDevice!.connect(timeout: const Duration(seconds: 10));
-      }
+      final targetDevice = await _scanAndConnectToLock();
 
       _addLog('Discovering services...');
-      final services = await targetDevice!.discoverServices();
+      final services = await targetDevice.discoverServices();
       
       BluetoothService? adminService;
       for (var s in services) {
@@ -448,7 +453,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
       }
 
       if (adminService == null) {
-        await targetDevice!.disconnect();
+        await targetDevice.disconnect();
         throw Exception('Admin Service (FCD4) not found.');
       }
 
@@ -463,11 +468,11 @@ class _MainAppScreenState extends State<MainAppScreen> {
       }
 
       if (pubKeyChar == null) {
-        await targetDevice!.disconnect();
+        await targetDevice.disconnect();
         throw Exception('PubKey Characteristic (FCD7) not found.');
       }
       if (chipIdChar == null) {
-        await targetDevice!.disconnect();
+        await targetDevice.disconnect();
         throw Exception('Chip ID Characteristic (FCD6) not found.');
       }
 
@@ -478,7 +483,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
       final fetchedChipId = chipValue.map((e) => e.toRadixString(16).padLeft(2, '0')).join(':').toUpperCase();
       _addLog('Key read successfully.');
 
-      await targetDevice!.disconnect();
+      await targetDevice.disconnect();
 
       if (fetchedKey.isNotEmpty && fetchedKey.length == 130) {
         setState(() {
@@ -584,63 +589,11 @@ class _MainAppScreenState extends State<MainAppScreen> {
       final pubKeyBytes = hexToBytes(pubKeyHex);
       final payload = [...userIdBytes, ...pubKeyBytes];
 
-      // 1. Scan for the lock
-      bool found = false;
-      BluetoothDevice? targetDevice;
-
-      var subscription = FlutterBluePlus.scanResults.listen((results) {
-        for (ScanResult r in results) {
-          if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
-            targetDevice = r.device;
-            found = true;
-            FlutterBluePlus.stopScan();
-            break;
-          }
-        }
-      });
-
-      await FlutterBluePlus.startScan(
-        withServices: [Guid("0000fcd2-0000-1000-8000-00805f9b34fb")],
-        timeout: const Duration(seconds: 5),
-      );
-
-      await FlutterBluePlus.isScanning.where((val) => val == false).first;
-      subscription.cancel();
-
-      if (!found) {
-         for (ScanResult r in FlutterBluePlus.lastScanResults) {
-            if (r.advertisementData.serviceUuids.contains(Guid("0000fcd2-0000-1000-8000-00805f9b34fb"))) {
-               targetDevice = r.device;
-               found = true;
-               break;
-            }
-         }
-      }
-
-      if (targetDevice == null) {
-        throw Exception('No DoorLink locks found nearby.');
-      }
-
-      // Give Android's BLE stack a brief moment to settle after scanning
-      if (Platform.isAndroid) {
-         await Future.delayed(const Duration(milliseconds: 500));
-      }
-
-      _addLog('Found lock: ${targetDevice!.remoteId}. Connecting...');
-      
-      // 2. Connect
-      try {
-        await targetDevice!.connect(timeout: const Duration(seconds: 5));
-      } catch (e) {
-        _addLog('First connect attempt failed. Retrying...');
-        await targetDevice!.disconnect(); // Clear any hung Android OS states
-        await Future.delayed(const Duration(milliseconds: 500));
-        await targetDevice!.connect(timeout: const Duration(seconds: 10));
-      }
+      final targetDevice = await _scanAndConnectToLock();
 
       // 3. Discover Services
       _addLog('Discovering services...');
-      final services = await targetDevice!.discoverServices();
+      final services = await targetDevice.discoverServices();
       
       BluetoothService? adminService;
       for (var s in services) {
@@ -651,7 +604,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
       }
 
       if (adminService == null) {
-        await targetDevice!.disconnect();
+        await targetDevice.disconnect();
         throw Exception('Admin Sync Service (FCD4) not found.');
       }
 
@@ -664,20 +617,20 @@ class _MainAppScreenState extends State<MainAppScreen> {
       }
 
       if (syncChar == null) {
-        await targetDevice!.disconnect();
+        await targetDevice.disconnect();
         throw Exception('Admin Sync Characteristic (FCD5) not found.');
       }
 
       // 4. Write Payload
       _addLog('Writing 69-byte payload...');
       if (Platform.isAndroid) {
-         await targetDevice!.requestMtu(128); // Ensure we can send all 69 bytes at once
+         await targetDevice.requestMtu(128); // Ensure we can send all 69 bytes at once
       }
       await syncChar.write(payload, withoutResponse: false);
       _addLog('Payload written successfully!');
 
       // 5. Disconnect
-      await targetDevice!.disconnect();
+      await targetDevice.disconnect();
 
       // 6. Update UI
       setState(() {
@@ -707,29 +660,152 @@ class _MainAppScreenState extends State<MainAppScreen> {
     }
   }
 
-  Widget _buildAdminScreen() {
-    if (_pendingUsers.isEmpty) {
-      return const Center(
-        child: Text('No pending users.\nShare a code from WhatsApp to add one.', textAlign: TextAlign.center),
-      );
+  Future<void> _fetchAdminDataViaBle() async {
+    setState(() {
+      _isAdminLoading = true;
+      _status = 'Fetching Lock Data...';
+    });
+    _addLog('Starting BLE Admin Data Fetch');
+
+    bool wasActive = _isActive;
+    if (wasActive) {
+      _addLog('Pausing background service for reliable BLE GATT...');
+      await _stopListening();
+      await Future.delayed(const Duration(milliseconds: 1500));
     }
-    return ListView.builder(
-      itemCount: _pendingUsers.length,
-      itemBuilder: (context, index) {
-        final user = _pendingUsers[index];
-        return Card(
-          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: ListTile(
-            leading: const Icon(Icons.person_add, color: Colors.blueGrey, size: 36),
-            title: Text('User ID: ${user['userId']}'),
-            subtitle: const Text('Tap icon to sync to lock via BLE'),
-            trailing: IconButton(
-              icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
-              onPressed: () => _syncUserViaBle(user['userId']!, user['pubKey']!),
+
+    try {
+      final targetDevice = await _scanAndConnectToLock();
+      final services = await targetDevice.discoverServices();
+      BluetoothService? adminService;
+      for (var s in services) {
+        if (s.uuid == Guid("0000fcd4-0000-1000-8000-00805f9b34fb")) adminService = s;
+      }
+      if (adminService == null) throw Exception('Admin Sync Service (FCD4) not found.');
+
+      BluetoothCharacteristic? usersChar;
+      BluetoothCharacteristic? statusChar;
+      for (var c in adminService.characteristics) {
+        if (c.uuid == Guid("0000fcd8-0000-1000-8000-00805f9b34fb")) usersChar = c;
+        if (c.uuid == Guid("0000fcd9-0000-1000-8000-00805f9b34fb")) statusChar = c;
+      }
+
+      if (usersChar != null) {
+        final usersBytes = await usersChar.read();
+        List<String> parsedUsers = [];
+        for (int i = 0; i < usersBytes.length; i += 4) {
+          if (i + 4 <= usersBytes.length) {
+            parsedUsers.add(usersBytes.sublist(i, i + 4).map((e) => e.toRadixString(16).padLeft(2, '0')).join().toUpperCase());
+          }
+        }
+        _enrolledUsers = parsedUsers;
+      }
+
+      if (statusChar != null) {
+        final statusBytes = await statusChar.read();
+        if (statusBytes.length >= 3) {
+          _lockRelayStatus = statusBytes[0] == 1 ? "ACTIVE (Unlocked)" : "Locked";
+          _lockSensorStatus = statusBytes[1] == 1 ? "DETECTED (Hand present)" : "Clear";
+        }
+      }
+
+      await targetDevice.disconnect();
+      setState(() { _status = 'Admin Data Refreshed'; });
+
+    } catch (e) {
+      _addLog('Admin Data Fetch failed: $e');
+      setState(() => _status = 'Data Fetch Failed');
+    } finally {
+      setState(() { _isAdminLoading = false; });
+      if (wasActive) await _initListening();
+    }
+  }
+
+  Future<void> _revokeUserViaBle(String userIdHex) async {
+    setState(() => _status = 'Revoking user...');
+    bool wasActive = _isActive;
+    if (wasActive) {
+      await _stopListening();
+      await Future.delayed(const Duration(milliseconds: 1500));
+    }
+    try {
+      List<int> hexToBytes(String hex) {
+        final clean = hex.trim().toLowerCase();
+        return List.generate(clean.length ~/ 2, (i) => int.parse(clean.substring(i * 2, i * 2 + 2), radix: 16));
+      }
+      final payload = hexToBytes(userIdHex);
+      
+      final targetDevice = await _scanAndConnectToLock();
+      final services = await targetDevice.discoverServices();
+      BluetoothCharacteristic? revokeChar;
+      for (var s in services) {
+        if (s.uuid == Guid("0000fcd4-0000-1000-8000-00805f9b34fb")) {
+          for (var c in s.characteristics) {
+            if (c.uuid == Guid("0000fcda-0000-1000-8000-00805f9b34fb")) revokeChar = c;
+          }
+        }
+      }
+
+      if (revokeChar == null) throw Exception('Revoke characteristic not found.');
+      await revokeChar.write(payload, withoutResponse: false);
+      await targetDevice.disconnect();
+
+    } catch (e) {
+      _addLog('Revoke failed: $e');
+    } finally {
+      if (wasActive) await _initListening();
+      _fetchAdminDataViaBle(); // Refresh the list automatically
+    }
+  }
+
+  Widget _buildAdminScreen() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _isAdminLoading ? null : _fetchAdminDataViaBle,
+              icon: _isAdminLoading 
+                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) 
+                  : const Icon(Icons.refresh),
+              label: const Padding(padding: EdgeInsets.all(12), child: Text('Connect & Refresh Lock Data')),
             ),
           ),
-        );
-      },
+          const SizedBox(height: 24),
+          const Text('System Status', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.memory, color: Colors.blueGrey, size: 36),
+              title: Text('Relay: $_lockRelayStatus'),
+              subtitle: Text('Sensor: $_lockSensorStatus'),
+            ),
+          ),
+          const SizedBox(height: 24),
+          const Text('Pending Approvals', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          if (_pendingUsers.isEmpty) const Text('No pending users. Share a code from WhatsApp.') 
+          else ..._pendingUsers.map((user) => Card(
+            color: Colors.green.shade50,
+            child: ListTile(
+              title: Text('User ID: ${user['userId']}'),
+              subtitle: const Text('Tap icon to sync to lock via BLE'),
+              trailing: IconButton(icon: const Icon(Icons.bluetooth_connected, color: Colors.green), onPressed: () => _syncUserViaBle(user['userId']!, user['pubKey']!)),
+            ),
+          )),
+          const SizedBox(height: 24),
+          const Text('Enrolled Users', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          if (_enrolledUsers.isEmpty) const Text('No users fetched. Tap refresh to load.') 
+          else ..._enrolledUsers.map((uid) => Card(
+            child: ListTile(
+              leading: const Icon(Icons.person, color: Colors.blueGrey),
+              title: Text('User ID: $uid'),
+              trailing: IconButton(icon: const Icon(Icons.delete, color: Colors.red), onPressed: () => _revokeUserViaBle(uid)),
+            ),
+          )),
+        ],
+      ),
     );
   }
 

@@ -48,7 +48,8 @@ class BeaconService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "doorlink_bg"
         private const val ADVERTISE_HOLD_MS = 2500L
-        private const val RESPONSE_RETRY_MS = 3000L
+        private const val RESPONSE_RETRY_MS = 5000L
+        private const val MAX_RESPONSE_RETRIES = 3
         private const val STATIC_UUID_HEX = "9f82c41d3b7a4291a1e6b5293d0cfa82"
     }
 
@@ -60,6 +61,7 @@ class BeaconService : Service() {
     private var lastChallengeHex: String = ""
     private var activeChallengeBytes: ByteArray = ByteArray(0)
     private var activeResponseBytes: ByteArray = ByteArray(0)
+    private var responseRetryCount: Int = 0
     private var currentServiceUuid: String = "0000fcd2-0000-1000-8000-00805f9b34fb"
     private val staticServiceUuid: ParcelUuid by lazy {
         ParcelUuid(Utils.uuidFrom16Bytes(hexStringToByteArray(STATIC_UUID_HEX)))
@@ -72,12 +74,18 @@ class BeaconService : Service() {
     private val responseRetryRunnable = object : Runnable {
         override fun run() {
             if (!serviceStarted) return
+            lastChallengeHex = ""
+            
+            // Restart scan to flush Android's BLE duplicate filter cache
+            startProximityScan()
+
             if (activeChallengeBytes.isNotEmpty() && activeResponseBytes.isNotEmpty()) {
-                if (advertiseCallback == null) {
+                if (advertiseCallback == null && responseRetryCount < MAX_RESPONSE_RETRIES) {
+                    responseRetryCount++
                     advertiseResponse(activeChallengeBytes, activeResponseBytes, false)
                 }
-                handler.postDelayed(this, RESPONSE_RETRY_MS)
             }
+            handler.postDelayed(this, RESPONSE_RETRY_MS)
         }
     }
 
@@ -213,6 +221,9 @@ class BeaconService : Service() {
         }
         activeChallengeBytes = challenge
         activeResponseBytes = response
+        responseRetryCount = 0
+        handler.removeCallbacks(responseRetryRunnable)
+        handler.postDelayed(responseRetryRunnable, RESPONSE_RETRY_MS)
         advertiseResponse(challenge, response, true)
     }
 
@@ -338,6 +349,7 @@ class BeaconService : Service() {
         serviceStarted = false
         activeChallengeBytes = ByteArray(0)
         activeResponseBytes = ByteArray(0)
+        responseRetryCount = 0
         lastChallengeHex = ""
     }
 

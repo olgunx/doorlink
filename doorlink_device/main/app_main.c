@@ -1,6 +1,7 @@
 #include "ble_scanner.h"
 #include "config.h"
 #include "device_key.h"
+#include "proximity_engine.h"
 #include "vl6180x.h"
 #include "enrollment_mgr.h"
 
@@ -48,7 +49,6 @@ static uint8_t s_last_user_id[LIGHTHOUSE_USER_ID_LEN];
 static uint8_t s_active_token[LIGHTHOUSE_TOKEN_LEN];
 static uint8_t s_previous_token[LIGHTHOUSE_TOKEN_LEN];
 static volatile uint32_t s_previous_token_valid_until_ms;
-static volatile uint32_t s_burn_cooldown_until_ms;
 static uint8_t s_active_challenge[LIGHTHOUSE_CHALLENGE_LEN];
 static uint8_t s_previous_challenge[LIGHTHOUSE_CHALLENGE_LEN];
 static volatile uint32_t s_previous_challenge_valid_until_ms;
@@ -92,6 +92,14 @@ static void format_uptime(char *buf, size_t buf_size, uint32_t ms)
 }
 static void set_relay(bool on) { gpio_set_level(RELAY_GPIO, RELAY_ACTIVE_LOW ? !on : on); }
 
+void get_system_status_bytes(uint8_t *out_buf) {
+    if (!out_buf) return;
+    // Byte 0: Relay Status, Byte 1: Laser Status, Byte 2: Auth Window Active
+    out_buf[0] = (s_relay_active_until_ms && (int32_t)(s_relay_active_until_ms - now_ms()) > 0) ? 1 : 0;
+    out_buf[1] = s_laser_detected ? 1 : 0;
+    out_buf[2] = s_authorized ? 1 : 0;
+}
+
 static void update_stealth_token(void)
 {
     memcpy(s_previous_token, s_active_token, LIGHTHOUSE_TOKEN_LEN);
@@ -108,9 +116,6 @@ static void update_stealth_token(void)
         memcpy(&s_active_challenge[i], &rnd, chunk);
     }
     s_previous_challenge_valid_until_ms = now_ms() + 5000;
-
-    s_authorized = false;
-    s_auth_window_started_ms = 0;
 
     ble_scanner_set_challenge_beacon(s_active_challenge);
 }
@@ -238,16 +243,17 @@ static void auth_task(void *arg)
                 }
 
                 uint8_t expected_response[LIGHTHOUSE_RESPONSE_LEN] = {0};
+                const bool response_ok = compute_expected_response(claim.user_id, claim.challenge, enrolled_pubkey, expected_response) &&
+                                         memcmp(claim.response, expected_response, LIGHTHOUSE_RESPONSE_LEN) == 0;
+
+                // Re-evaluate matches AFTER heavy crypto to avoid race with sensor_task burn
                 const bool active_challenge_match = memcmp(claim.challenge, s_active_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
                 const bool previous_challenge_match = s_previous_challenge_valid_until_ms != 0 &&
                                                       now_ms() <= s_previous_challenge_valid_until_ms &&
                                                       memcmp(claim.challenge, s_previous_challenge, LIGHTHOUSE_CHALLENGE_LEN) == 0;
-                const bool response_ok = compute_expected_response(claim.user_id, claim.challenge, enrolled_pubkey, expected_response) &&
-                                         memcmp(claim.response, expected_response, LIGHTHOUSE_RESPONSE_LEN) == 0;
 
                 if ((active_challenge_match || previous_challenge_match) &&
-                    response_ok &&
-                    now_ms() >= s_burn_cooldown_until_ms) {
+                    response_ok) {
                     s_claim_match_count++;
                     s_authorized = true;
                     s_auth_window_started_ms = now_ms();
@@ -264,15 +270,29 @@ static void auth_task(void *arg)
     }
 }
 
+#define ARRIVED_LEAVE_RSSI_DBM  (BEACON_ARRIVED_RSSI_DBM - 10)  /* -83 dBm: must drop 10 dB to un-arrive */
+
+static rssi_smoother_t s_claim_rssi_smoother;
+static bool s_smoother_initialized = false;
+
 static void claim_detected(const lighthouse_ble_claim_t *claim)
 {
     if (claim == NULL) {
         return;
     }
+    if (!s_smoother_initialized) {
+        proximity_rssi_init(&s_claim_rssi_smoother);
+        s_smoother_initialized = true;
+    }
+    const int smoothed = proximity_rssi_update(&s_claim_rssi_smoother, claim->rssi);
     s_claim_rx_count++;
     s_last_claim_ms = now_ms();
-    s_last_claim_rssi = claim->rssi;
-    s_arrived = claim->rssi >= BEACON_ARRIVED_RSSI_DBM;
+    s_last_claim_rssi = smoothed;
+    if (!s_arrived) {
+        s_arrived = smoothed >= BEACON_ARRIVED_RSSI_DBM;
+    } else {
+        s_arrived = smoothed >= ARRIVED_LEAVE_RSSI_DBM;
+    }
     memcpy(s_last_user_id, claim->user_id, LIGHTHOUSE_USER_ID_LEN);
 
     // Send to queue to offload heavy crypto from nimble_host task
@@ -295,6 +315,11 @@ static void status_task(void *arg)
 
         if (s_last_claim_ms != 0 && last_claim_age_ms > CLAIM_IDLE_TIMEOUT_MS) {
             s_arrived = false; // Reset arrived status if app goes out of range
+            s_authorized = false; // Drop auth if phone leaves the area completely
+        }
+        
+        if (s_authorized && s_auth_window_started_ms != 0 && (now - s_auth_window_started_ms) > CLAIM_IDLE_TIMEOUT_MS) {
+            s_authorized = false; // Drop auth if we haven't received a valid cryptogram recently
         }
 
         const bool comm = s_last_claim_ms != 0 && last_claim_age_ms <= CLAIM_IDLE_TIMEOUT_MS;
@@ -373,13 +398,15 @@ static void sensor_task(void *arg)
             s_relay_active_until_ms = now_ms() + RELAY_TRIGGER_MS;
 
             update_stealth_token(); // Roll immediately
-            s_burn_cooldown_until_ms = now_ms() + 2500;
             g_manual_unlock_until_ms = 0;
             s_previous_token_valid_until_ms = 0;
             s_previous_challenge_valid_until_ms = 0;
 
             s_authorized = false;
+            s_auth_window_started_ms = 0;
+            s_arrived = false;
             s_last_claim_ms = 0; // require a fresh claim/token exchange after burn
+            proximity_rssi_init(&s_claim_rssi_smoother);
             char ts[16];
             format_uptime(ts, sizeof(ts), now_ms());
             ESP_LOGI(TAG, "[%s] challenge burned; waiting for new claim", ts);
@@ -436,8 +463,8 @@ void app_main(void)
     ESP_ERROR_CHECK(enrollment_mgr_init());
 
     gpio_reset_pin(RELAY_GPIO);
+    set_relay(false); // Set logical level HIGH (secure) BEFORE enabling output
     gpio_set_direction(RELAY_GPIO, GPIO_MODE_OUTPUT);
-    set_relay(false);
 
     ESP_ERROR_CHECK(init_vl6180x_bus());
     update_stealth_token(); // Initialize the current challenge beacon

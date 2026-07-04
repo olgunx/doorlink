@@ -17,6 +17,9 @@
 
 static const char *TAG = "ble_scanner";
 static uint8_t s_own_addr_type;
+
+extern size_t enrollment_mgr_get_user_ids(uint8_t *out_buf, size_t max_len);
+extern void get_system_status_bytes(uint8_t *out_buf);
 static lighthouse_claim_detected_cb_t s_claim_cb;
 static bool s_adv_disabled;
 static uint8_t s_challenge_nonce[LIGHTHOUSE_CHALLENGE_LEN];
@@ -84,10 +87,57 @@ static int admin_pubkey_access(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 }
 
+// --- Admin Enrolled Users Read ---
+static int admin_users_read_access(uint16_t conn_handle, uint16_t attr_handle,
+                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        uint8_t buf[256] = {0}; // Fits up to 64 enrolled users (4 bytes each)
+        size_t len = enrollment_mgr_get_user_ids(buf, sizeof(buf));
+        int rc = os_mbuf_append(ctxt->om, buf, len);
+        return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// --- Admin System Status Read ---
+static int admin_status_read_access(uint16_t conn_handle, uint16_t attr_handle,
+                                    struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        uint8_t buf[3] = {0};
+        get_system_status_bytes(buf);
+        int rc = os_mbuf_append(ctxt->om, buf, sizeof(buf));
+        return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+// --- Admin Revoke User Write ---
+static int admin_revoke_write_access(uint16_t conn_handle, uint16_t attr_handle,
+                                     struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len == LIGHTHOUSE_USER_ID_LEN) {
+            uint8_t user_id[4];
+            if (ble_hs_mbuf_to_flat(ctxt->om, user_id, sizeof(user_id), NULL) == 0) {
+                ESP_LOGI(TAG, "GATT Admin Revoke Payload received. Deleting user.");
+                enrollment_mgr_revoke_device(user_id);
+            }
+        }
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
 static const ble_uuid16_t admin_svc_uuid = BLE_UUID16_INIT(0xFCD4);
 static const ble_uuid16_t admin_chr_uuid = BLE_UUID16_INIT(0xFCD5);
 static const ble_uuid16_t admin_chip_id_uuid = BLE_UUID16_INIT(0xFCD6);
 static const ble_uuid16_t admin_pubkey_uuid = BLE_UUID16_INIT(0xFCD7);
+static const ble_uuid16_t admin_users_uuid = BLE_UUID16_INIT(0xFCD8);
+static const ble_uuid16_t admin_status_uuid = BLE_UUID16_INIT(0xFCD9);
+static const ble_uuid16_t admin_revoke_uuid = BLE_UUID16_INIT(0xFCDA);
 
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
     {
@@ -108,6 +158,21 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .uuid = &admin_pubkey_uuid.u,
                 .access_cb = admin_pubkey_access,
                 .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = &admin_users_uuid.u,
+                .access_cb = admin_users_read_access,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = &admin_status_uuid.u,
+                .access_cb = admin_status_read_access,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid = &admin_revoke_uuid.u,
+                .access_cb = admin_revoke_write_access,
+                .flags = BLE_GATT_CHR_F_WRITE,
             },
             { 0 }
         }

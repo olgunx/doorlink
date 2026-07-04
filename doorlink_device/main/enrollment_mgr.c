@@ -192,3 +192,23 @@ bool enrollment_mgr_is_device_active(const uint8_t *user_id, uint8_t *out_pubkey
     }
     return false;
 }
+
+size_t enrollment_mgr_get_user_ids(uint8_t *out_buf, size_t max_len)
+{
+    if (out_buf == NULL || max_len == 0) {
+        return 0;
+    }
+    enrolled_device_t devices[ENROLLMENT_MAX_DEVICES] = {0};
+    size_t size = sizeof(devices);
+    if (nvs_get_blob(s_handle, KEY_DEVICES, devices, &size) != ESP_OK) {
+        return 0;
+    }
+    size_t count = 0;
+    for (int i = 0; i < ENROLLMENT_MAX_DEVICES; i++) {
+        if (devices[i].active && (count * LIGHTHOUSE_USER_ID_LEN + LIGHTHOUSE_USER_ID_LEN) <= max_len) {
+            memcpy(&out_buf[count * LIGHTHOUSE_USER_ID_LEN], devices[i].user_id, LIGHTHOUSE_USER_ID_LEN);
+            count++;
+        }
+    }
+    return count * LIGHTHOUSE_USER_ID_LEN;
+}
