@@ -98,7 +98,8 @@ class MainActivity : FlutterActivity() {
                     result.success(powerManager.isIgnoringBatteryOptimizations(packageName))
                 }
                 "openBatteryOptimizationSettings" -> {
-                    val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    intent.data = android.net.Uri.parse("package:$packageName")
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     startActivity(intent)
                     result.success("OK")

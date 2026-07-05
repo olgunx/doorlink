@@ -53,7 +53,8 @@ static uint8_t s_active_challenge[LIGHTHOUSE_CHALLENGE_LEN];
 static uint8_t s_previous_challenge[LIGHTHOUSE_CHALLENGE_LEN];
 static volatile uint32_t s_previous_challenge_valid_until_ms;
 static bool s_enrolled_pubkey_logged;
-static bool s_device_pubkey_logged;
+static bool s_device_pubkey_logged = false;
+static bool g_hw_failure = false;
 
 static nvs_handle_t s_nvs = 0;
 static QueueHandle_t s_claim_queue = NULL;
@@ -385,11 +386,21 @@ static void sensor_task(void *arg)
 {
     (void)arg;
     while (true) {
+        if (g_hw_failure) {
+            // Attempt to re-initialize if it was previously failed (e.g. hot-plugged)
+            if (vl6180x_init(VL6180X_I2C_PORT) == ESP_OK) {
+                g_hw_failure = false;
+                ESP_LOGI(TAG, "Laser sensor recovered and initialized!");
+            }
+        }
+
         uint16_t distance_mm = 0;
-        if (vl6180x_read_range_mm(VL6180X_I2C_PORT, &distance_mm) == ESP_OK) {
+        if (!g_hw_failure && vl6180x_read_range_mm(VL6180X_I2C_PORT, &distance_mm) == ESP_OK) {
             s_laser_detected = distance_mm > 0 && distance_mm <= VL6180X_PRESENCE_THRESHOLD_MM;
+            g_hw_failure = false;
         } else {
             s_laser_detected = false;
+            g_hw_failure = true;
         }
 
         bool manual_trigger = g_manual_unlock_until_ms && (int32_t)(g_manual_unlock_until_ms - now_ms()) > 0;
@@ -420,11 +431,22 @@ static void relay_task(void *arg)
     (void)arg;
     bool relay_on = false;
     bool auth_led_on = false;
+    uint32_t red_blink_counter = 0;
+    bool red_led_state = false;
+    uint32_t green_blink_counter = 0;
+    bool green_led_state = false;
     
     gpio_reset_pin(ALIVE_LED_GPIO); // GPIO 12 Auth LED
     gpio_set_direction(ALIVE_LED_GPIO, GPIO_MODE_OUTPUT);
     gpio_reset_pin(DETECTION_LED_GPIO); // GPIO 13 Open LED
     gpio_set_direction(DETECTION_LED_GPIO, GPIO_MODE_OUTPUT);
+    
+    gpio_reset_pin(GREEN_LED_GPIO);
+    gpio_set_level(GREEN_LED_GPIO, 1); // Active low, 1 is OFF
+    gpio_set_direction(GREEN_LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(RED_LED_GPIO);
+    gpio_set_level(RED_LED_GPIO, 1); // Active low, 1 is OFF
+    gpio_set_direction(RED_LED_GPIO, GPIO_MODE_OUTPUT);
 
     while (true) {
         bool should_on = s_relay_active_until_ms && (int32_t)(s_relay_active_until_ms - now_ms()) > 0;
@@ -437,6 +459,54 @@ static void relay_task(void *arg)
             auth_led_on = s_authorized;
             gpio_set_level(ALIVE_LED_GPIO, auth_led_on ? 1 : 0);
         }
+        
+        // Red LED HW Failure Blinking
+        if (g_hw_failure) {
+            red_blink_counter++;
+            if (red_blink_counter >= 25) { // Toggle every 500ms (25 * 20ms)
+                red_blink_counter = 0;
+                red_led_state = !red_led_state;
+                gpio_set_level(RED_LED_GPIO, red_led_state ? 0 : 1); // Active low
+            }
+        } else {
+            red_blink_counter = 0;
+            red_led_state = false;
+            gpio_set_level(RED_LED_GPIO, 1); // Active low, 1 is OFF
+        }
+        
+        // Green LED Stage Blinking
+        const uint32_t now = now_ms();
+        const uint32_t last_claim_age_ms = s_last_claim_ms == 0 ? 0 : (now - s_last_claim_ms);
+        const bool comm = s_last_claim_ms != 0 && last_claim_age_ms <= CLAIM_IDLE_TIMEOUT_MS;
+        
+        uint8_t stage_count = 0;
+        if (comm) stage_count++;
+        if (s_authorized) stage_count++;
+        if (s_arrived) stage_count++;
+        if (s_laser_detected) stage_count++;
+        
+        uint32_t green_blink_threshold = 0;
+        if (stage_count == 1) green_blink_threshold = 50;      // 1000ms (slow)
+        else if (stage_count == 2) green_blink_threshold = 25; // 500ms (medium)
+        else if (stage_count >= 3) green_blink_threshold = 5;  // 100ms (fast)
+        
+        if (relay_on) {
+            gpio_set_level(GREEN_LED_GPIO, 0); // Solid ON (Active low)
+            green_blink_counter = 0;
+            green_led_state = true;
+        } else if (stage_count > 0) {
+            green_blink_counter++;
+            if (green_blink_counter >= green_blink_threshold) {
+                green_blink_counter = 0;
+                green_led_state = !green_led_state;
+                gpio_set_level(GREEN_LED_GPIO, green_led_state ? 0 : 1);
+            }
+        } else {
+            gpio_set_level(GREEN_LED_GPIO, 1); // Solid OFF
+            green_blink_counter = 0;
+            green_led_state = false;
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -466,7 +536,11 @@ void app_main(void)
     set_relay(false); // Set logical level HIGH (secure) BEFORE enabling output
     gpio_set_direction(RELAY_GPIO, GPIO_MODE_OUTPUT);
 
-    ESP_ERROR_CHECK(init_vl6180x_bus());
+    esp_err_t sensor_err = init_vl6180x_bus();
+    if (sensor_err != ESP_OK) {
+        ESP_LOGW(TAG, "Laser sensor not detected: %s. Continuing without hardware sensor.", esp_err_to_name(sensor_err));
+        g_hw_failure = true;
+    }
     update_stealth_token(); // Initialize the current challenge beacon
     ESP_ERROR_CHECK(ble_scanner_set_static_uuid_beacon(STATIC_UUID));
     ble_scanner_set_claim_detected_cb(claim_detected);

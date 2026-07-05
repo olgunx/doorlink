@@ -34,6 +34,8 @@ extern "C" {
 
 #define ALIVE_LED_GPIO               12
 #define DETECTION_LED_GPIO           13
+#define GREEN_LED_GPIO               10
+#define RED_LED_GPIO                 6
 #define STATUS_LED_ACTIVE_LOW        0
 #define ALIVE_LED_PERIOD_MS          500
 #define DETECTION_LED_HOLD_MS        3000

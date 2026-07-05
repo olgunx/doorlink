@@ -48,7 +48,7 @@ class BeaconService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "doorlink_bg"
         private const val ADVERTISE_HOLD_MS = 2500L
-        private const val RESPONSE_RETRY_MS = 5000L
+        private const val RESPONSE_RETRY_MS = 10000L
         private const val MAX_RESPONSE_RETRIES = 3
         private const val STATIC_UUID_HEX = "9f82c41d3b7a4291a1e6b5293d0cfa82"
     }
@@ -193,7 +193,7 @@ class BeaconService : Service() {
             .build()
         val filters = listOf(filter)
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
             .build()
 
         try {

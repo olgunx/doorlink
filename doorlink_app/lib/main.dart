@@ -281,8 +281,10 @@ class _MainAppScreenState extends State<MainAppScreen> {
     if (!mounted || !_isActive) return;
 
     if (_espPublicKey.isEmpty) {
-      setState(() => _status = 'Missing Lock Public Key! Pair first.');
-      _addLog("Error: Missing Lock Public Key. Pair via Wi-Fi.");
+      _addLog("Skipping background service: Missing Lock Public Key (Admin-only mode).");
+      if (_isActive) {
+        setState(() => _isActive = false);
+      }
       return;
     }
 
