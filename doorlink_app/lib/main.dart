@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'about_info.dart';
 import 'dart:math';
 import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
@@ -50,6 +51,10 @@ class _MainAppScreenState extends State<MainAppScreen> {
 
   // Engine State
   String _status = 'Initializing...';
+  String _rangeStatus = 'OUT_OF_RANGE';
+  bool _isUnlocked = false;
+  Timer? _rangeResetTimer;
+  Timer? _unlockResetTimer;
   final List<String> _logs = [];
   final List<Map<String, String>> _pendingUsers = [];
   List<String> _enrolledUsers = [];
@@ -153,12 +158,47 @@ class _MainAppScreenState extends State<MainAppScreen> {
     ReceiveSharingIntent.instance.reset(); // clear the intent so it doesn't trigger again
   }
 
+  void _resetRangeTimer() {
+    _rangeResetTimer?.cancel();
+    _rangeResetTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && _rangeStatus != 'OUT_OF_RANGE') {
+        setState(() => _rangeStatus = 'OUT_OF_RANGE');
+      }
+    });
+  }
+
   Future<void> _handleNativeCall(MethodCall call) async {
     if (call.method == 'onNativeDebug') {
       final message = call.arguments?.toString() ?? '';
       if (message.isNotEmpty) {
-        _addLog(message);
-        if (message.contains('scan started')) {
+        if (!message.startsWith('RSSI:')) {
+          _addLog(message);
+        }
+        
+        if (message.startsWith('RSSI:')) {
+          final parts = message.split(':');
+          if (parts.length == 2) {
+            final rssi = int.tryParse(parts[1]) ?? -100;
+            String newStatus = 'FAR';
+            if (rssi >= -65) {
+               newStatus = 'AT_DOOR';
+            } else if (rssi >= -85) {
+               newStatus = 'CLOSER';
+            }
+            if (_rangeStatus != newStatus) {
+               setState(() => _rangeStatus = newStatus);
+            }
+            _resetRangeTimer();
+          }
+        } else if (message == 'EVENT:CHALLENGE_ROTATED') {
+          setState(() {
+             _isUnlocked = true;
+          });
+          _unlockResetTimer?.cancel();
+          _unlockResetTimer = Timer(const Duration(seconds: 6), () {
+             if (mounted) setState(() => _isUnlocked = false);
+          });
+        } else if (message.contains('scan started')) {
           setState(() => _status = 'Waiting for Beacon...');
         } else if (message.contains('Response advertising started')) {
           setState(() => _status = 'Broadcasting BLE...');
@@ -525,6 +565,75 @@ class _MainAppScreenState extends State<MainAppScreen> {
     }
   }
 
+  Widget _buildDynamicBanner() {
+    IconData icon;
+    Color color;
+    String title;
+    String subtitle;
+
+    if (_isUnlocked) {
+      icon = Icons.check_circle;
+      color = Colors.green;
+      title = 'Door is Unlocked';
+      subtitle = 'Welcome!';
+    } else if (_rangeStatus == 'OUT_OF_RANGE') {
+      icon = Icons.location_off;
+      color = Colors.grey;
+      title = 'Door is out of range';
+      subtitle = 'Walk towards the door.';
+    } else if (_rangeStatus == 'AT_DOOR' && _status == 'Broadcasting BLE...') {
+      icon = Icons.waving_hand;
+      color = Colors.green;
+      title = 'Ready to Open';
+      subtitle = 'Wave your hand over sensor.';
+    } else {
+      // FAR or CLOSER
+      icon = Icons.directions_walk;
+      color = Colors.orange;
+      title = 'You are in the range';
+      subtitle = 'But be closer to unlock the door.';
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(top: 20, left: 20, right: 20),
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        border: Border.all(color: color),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 28),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: color == Colors.grey ? Colors.grey.shade800 : (color == Colors.green ? Colors.green : Colors.orange.shade800),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    color: color == Colors.grey ? Colors.grey.shade700 : (color == Colors.green ? Colors.green.shade800 : Colors.orange.shade800),
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildMainScreen() {
     return Center(
       child: Column(
@@ -542,7 +651,8 @@ class _MainAppScreenState extends State<MainAppScreen> {
           ),
           const SizedBox(height: 10),
           Text('Status: $_status', style: const TextStyle(fontSize: 16, color: Colors.grey)),
-          const SizedBox(height: 60),
+          if (_isActive) _buildDynamicBanner(),
+          const SizedBox(height: 40),
           SwitchListTile(
             title: const Text('Enable Auto-Unlock', style: TextStyle(fontWeight: FontWeight.bold)),
             subtitle: const Text('Listen for door beacon in background'),
@@ -940,6 +1050,38 @@ class _MainAppScreenState extends State<MainAppScreen> {
             label: const Text('Share Fingerprint with Admin'),
           ),
         ),
+        const SizedBox(height: 32),
+        const Divider(),
+        const SizedBox(height: 16),
+        const Text('About', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 10),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.info_outline, color: Colors.blueGrey),
+                    SizedBox(width: 12),
+                    Text('DoorLink', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                const Text(AboutInfo.appDescription, style: TextStyle(fontSize: 14)),
+                const SizedBox(height: 12),
+                const Text(AboutInfo.deviceDescription, style: TextStyle(fontSize: 14)),
+                const Divider(height: 24),
+                Text('Developed by: ${AboutInfo.developer}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 4),
+                Text('Build Date: ${AboutInfo.buildDate}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                Text('Commit: ${AboutInfo.commitHash}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
         ],
       ),
     );

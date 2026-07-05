@@ -222,7 +222,13 @@ class BeaconService : Service() {
 
         val challenge = challengeBytes.copyOfRange(0, 8)
         val challengeHex = bytesToHex(challenge)
+        
+        emitDebug("RSSI:${result.rssi}")
+        
         if (challengeHex == lastChallengeHex) return
+        if (lastChallengeHex.isNotEmpty()) {
+            emitDebug("EVENT:CHALLENGE_ROTATED")
+        }
         lastChallengeHex = challengeHex
 
         val response = computeResponse(userIdBytes, challenge) ?: run {
