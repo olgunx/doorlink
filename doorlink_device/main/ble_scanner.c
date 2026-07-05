@@ -218,6 +218,9 @@ static bool extract_claim(const struct ble_hs_adv_fields *fields, lighthouse_ble
 {
     const size_t expected_len = LIGHTHOUSE_USER_ID_LEN + LIGHTHOUSE_CHALLENGE_LEN + LIGHTHOUSE_RESPONSE_LEN;
     const uint8_t *pub_key = device_key_get_public();
+    if (pub_key == NULL) {
+        return false;
+    }
     const uint16_t expected_company_id_le = (uint16_t)pub_key[2] | ((uint16_t)pub_key[1] << 8);
     if (fields->mfg_data == NULL) {
         return false;
@@ -366,6 +369,10 @@ static void start_adv(void)
 
     if (s_challenge_set) {
         const uint8_t *pub_key = device_key_get_public();
+        if (pub_key == NULL) {
+            ESP_LOGE(TAG, "Cannot advertise: device key not loaded");
+            return;
+        }
         static uint8_t challenge_mfg_buf[2 + LIGHTHOUSE_CHALLENGE_LEN];
         challenge_mfg_buf[0] = pub_key[2]; // Little Endian LSB
         challenge_mfg_buf[1] = pub_key[1]; // Little Endian MSB

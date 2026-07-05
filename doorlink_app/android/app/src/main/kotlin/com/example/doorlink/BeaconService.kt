@@ -156,7 +156,13 @@ class BeaconService : Service() {
             handler.postDelayed(responseRetryRunnable, RESPONSE_RETRY_MS)
         }
 
-        ensureBluetooth()
+        try {
+            ensureBluetooth()
+        } catch (e: Exception) {
+            emitDebug("Bluetooth init failed: ${e.message}")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         startProximityScan()
         
         if (activeChallengeBytes.isNotEmpty() && activeResponseBytes.isNotEmpty()) {
@@ -200,7 +206,11 @@ class BeaconService : Service() {
             scanner?.stopScan(scanCallback)
         } catch (_: Exception) {
         }
-        scanner?.startScan(filters, settings, scanCallback)
+        try {
+            scanner?.startScan(filters, settings, scanCallback)
+        } catch (e: Exception) {
+            emitDebug("BLE scan start failed: ${e.message}")
+        }
         emitDebug("BLE background scan started")
         emitDebug("BLE scan requested with ${filters.size} filters, low-latency mode")
     }
@@ -228,6 +238,10 @@ class BeaconService : Service() {
     }
 
     private fun advertiseResponse(challenge: ByteArray, response: ByteArray, emitLog: Boolean) {
+        if (!::advertiser.isInitialized) {
+            emitDebug("BLE advertiser not available")
+            return
+        }
         stopAdvertising()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -355,6 +369,7 @@ class BeaconService : Service() {
 
     override fun onDestroy() {
         Log.i(logTag, "service onDestroy")
+        stopEverything()
         super.onDestroy()
     }
 

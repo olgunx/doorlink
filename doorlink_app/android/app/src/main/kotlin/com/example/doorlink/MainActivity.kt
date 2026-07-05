@@ -80,16 +80,24 @@ class MainActivity : FlutterActivity() {
                         putExtra(BeaconService.EXTRA_USER_ID, userId)
                         putExtra(BeaconService.EXTRA_ESP_PUB_KEY, espPubKey)
                     }
-                    ContextCompat.startForegroundService(this, intent)
-                    result.success("OK")
+                    try {
+                        ContextCompat.startForegroundService(this, intent)
+                        result.success("OK")
+                    } catch (e: Exception) {
+                        result.error("ERR_START_SERVICE", e.message, null)
+                    }
                 }
 
                 "stopBackgroundService" -> {
                     val intent = Intent(this, BeaconService::class.java).apply {
                         action = BeaconService.ACTION_STOP
                     }
-                    startService(intent)
-                    result.success("OK")
+                    try {
+                        startService(intent)
+                        result.success("OK")
+                    } catch (e: Exception) {
+                        result.error("ERR_STOP_SERVICE", e.message, null)
+                    }
                 }
 
                 "getAndroidSdkInt" -> result.success(Build.VERSION.SDK_INT)
@@ -98,11 +106,15 @@ class MainActivity : FlutterActivity() {
                     result.success(powerManager.isIgnoringBatteryOptimizations(packageName))
                 }
                 "openBatteryOptimizationSettings" -> {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                    intent.data = android.net.Uri.parse("package:$packageName")
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    startActivity(intent)
-                    result.success("OK")
+                    try {
+                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                        intent.data = android.net.Uri.parse("package:$packageName")
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        result.success("OK")
+                    } catch (e: Exception) {
+                        result.error("ERR_BATTERY_SETTINGS", e.message, null)
+                    }
                 }
                 else -> result.notImplemented()
             }

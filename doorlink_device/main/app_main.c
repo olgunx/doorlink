@@ -54,7 +54,8 @@ static uint8_t s_previous_challenge[LIGHTHOUSE_CHALLENGE_LEN];
 static volatile uint32_t s_previous_challenge_valid_until_ms;
 static bool s_enrolled_pubkey_logged;
 static bool s_device_pubkey_logged = false;
-static bool g_hw_failure = false;
+static volatile bool g_hw_failure = false;
+static volatile bool g_sw_failure = false;
 
 static nvs_handle_t s_nvs = 0;
 static QueueHandle_t s_claim_queue = NULL;
@@ -449,6 +450,19 @@ static void relay_task(void *arg)
     gpio_set_direction(RED_LED_GPIO, GPIO_MODE_OUTPUT);
 
     while (true) {
+        // SW failure takes highest priority — blink BOTH LEDs together
+        if (g_sw_failure) {
+            red_blink_counter++;
+            if (red_blink_counter >= 12) { // Toggle every 240ms (12 * 20ms) — fast alarm
+                red_blink_counter = 0;
+                red_led_state = !red_led_state;
+                gpio_set_level(RED_LED_GPIO, red_led_state ? 0 : 1);
+                gpio_set_level(GREEN_LED_GPIO, red_led_state ? 0 : 1);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
         bool should_on = s_relay_active_until_ms && (int32_t)(s_relay_active_until_ms - now_ms()) > 0;
         if (should_on != relay_on) {
             relay_on = should_on;
@@ -515,12 +529,34 @@ void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_erase();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "NVS flash erase failed: %s", esp_err_to_name(ret));
+            g_sw_failure = true;
+        }
         ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
-    ESP_ERROR_CHECK(nvs_open(NVS_NS, NVS_READWRITE, &s_nvs));
-    ESP_ERROR_CHECK(device_key_init());
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS flash init failed: %s", esp_err_to_name(ret));
+        g_sw_failure = true;
+    }
+
+    if (!g_sw_failure) {
+        ret = nvs_open(NVS_NS, NVS_READWRITE, &s_nvs);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(ret));
+            g_sw_failure = true;
+        }
+    }
+
+    if (!g_sw_failure) {
+        ret = device_key_init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Device key init failed: %s", esp_err_to_name(ret));
+            g_sw_failure = true;
+        }
+    }
+
     if (!s_device_pubkey_logged) {
         s_device_pubkey_logged = true;
         const uint8_t *device_pubkey = device_key_get_public();
@@ -530,7 +566,14 @@ void app_main(void)
                      bytes_to_hex(device_pubkey, DEVICE_KEY_PUB_LEN, pubkey_hex, sizeof(pubkey_hex)));
         }
     }
-    ESP_ERROR_CHECK(enrollment_mgr_init());
+
+    if (!g_sw_failure) {
+        ret = enrollment_mgr_init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Enrollment manager init failed: %s", esp_err_to_name(ret));
+            g_sw_failure = true;
+        }
+    }
 
     gpio_reset_pin(RELAY_GPIO);
     set_relay(false); // Set logical level HIGH (secure) BEFORE enabling output
@@ -541,16 +584,43 @@ void app_main(void)
         ESP_LOGW(TAG, "Laser sensor not detected: %s. Continuing without hardware sensor.", esp_err_to_name(sensor_err));
         g_hw_failure = true;
     }
-    update_stealth_token(); // Initialize the current challenge beacon
-    ESP_ERROR_CHECK(ble_scanner_set_static_uuid_beacon(STATIC_UUID));
-    ble_scanner_set_claim_detected_cb(claim_detected);
-    ESP_ERROR_CHECK(ble_scanner_init());
 
-    s_claim_queue = xQueueCreate(1, sizeof(lighthouse_ble_claim_t));
-    xTaskCreate(auth_task, "auth_task", 8192, NULL, 5, NULL);
+    if (!g_sw_failure) {
+        update_stealth_token(); // Initialize the current challenge beacon
+        ret = ble_scanner_set_static_uuid_beacon(STATIC_UUID);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "BLE beacon UUID set failed: %s", esp_err_to_name(ret));
+            g_sw_failure = true;
+        }
+    }
 
-    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+    if (!g_sw_failure) {
+        ble_scanner_set_claim_detected_cb(claim_detected);
+        ret = ble_scanner_init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "BLE scanner init failed: %s", esp_err_to_name(ret));
+            g_sw_failure = true;
+        }
+    }
+
+    if (!g_sw_failure) {
+        s_claim_queue = xQueueCreate(1, sizeof(lighthouse_ble_claim_t));
+        if (s_claim_queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create claim queue (heap exhausted)");
+            g_sw_failure = true;
+        }
+    }
+
+    if (g_sw_failure) {
+        ESP_LOGE(TAG, "CRITICAL: Software failure detected. System running in degraded mode. Check LEDs.");
+    }
+
+    // Always start these tasks — relay_task drives LED failure indicators even in degraded mode
+    if (!g_sw_failure) {
+        xTaskCreate(auth_task, "auth_task", 8192, NULL, 5, NULL);
+        xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+        xTaskCreate(token_rotate_task, "token_rotate_task", 3072, NULL, 5, NULL);
+        xTaskCreate(status_task, "status_task", 4096, NULL, 5, NULL);
+    }
     xTaskCreate(relay_task, "relay_task", 2048, NULL, 5, NULL);
-    xTaskCreate(token_rotate_task, "token_rotate_task", 3072, NULL, 5, NULL);
-    xTaskCreate(status_task, "status_task", 4096, NULL, 5, NULL);
 }

@@ -205,6 +205,10 @@ static esp_err_t api_enrollments_get_handler(httpd_req_t *req)
     size_t count = enrollment_mgr_get_devices(devs, ENROLLMENT_MAX_DEVICES);
     
     cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     cJSON *arr = cJSON_CreateArray();
     cJSON_AddItemToObject(root, "enrollments", arr);
     
@@ -219,6 +223,11 @@ static esp_err_t api_enrollments_get_handler(httpd_req_t *req)
     }
     
     const char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str == NULL) {
+        cJSON_Delete(root);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
     
@@ -312,8 +321,17 @@ static esp_err_t api_pubkey_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     cJSON_AddStringToObject(root, "pubkey", esp_pub_hex);
     const char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str == NULL) {
+        cJSON_Delete(root);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     esp_err_t ret = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
     cJSON_free((void *)json_str);
