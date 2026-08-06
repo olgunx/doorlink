@@ -290,7 +290,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
   }
 
   Future<void> _initListening() async {
-    final sdkInt = await _getAndroidSdkInt();
+    await _getAndroidSdkInt();
 
     final permissionsToRequest = <Permission>[
       Permission.bluetooth,
@@ -598,7 +598,7 @@ class _MainAppScreenState extends State<MainAppScreen> {
       margin: const EdgeInsets.only(top: 20, left: 20, right: 20),
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
+        color: color.withValues(alpha: 0.1),
         border: Border.all(color: color),
         borderRadius: BorderRadius.circular(8),
       ),
@@ -1051,36 +1051,9 @@ class _MainAppScreenState extends State<MainAppScreen> {
           ),
         ),
         const SizedBox(height: 32),
-        const Divider(),
-        const SizedBox(height: 16),
-        const Text('About', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 10),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.info_outline, color: Colors.blueGrey),
-                    SizedBox(width: 12),
-                    Text('DoorLink', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                const Text(AboutInfo.appDescription, style: TextStyle(fontSize: 14)),
-                const SizedBox(height: 12),
-                const Text(AboutInfo.deviceDescription, style: TextStyle(fontSize: 14)),
-                const Divider(height: 24),
-                Text('Developed by: ${AboutInfo.developer}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                Text('Build Date: ${AboutInfo.buildDate}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                Text('Commit: ${AboutInfo.commitHash}', style: const TextStyle(fontSize: 12, color: Colors.grey)),
-              ],
-            ),
-          ),
-        ),
+        const SizedBox(height: 24),
+        const AboutSection(),
+        const SizedBox(height: 24),
         const SizedBox(height: 20),
         ],
       ),

@@ -53,6 +53,32 @@ When the lock receives the broadcast, it runs the `compute_expected_response()` 
 
 ## 📱 Mobile App (Flutter / Android)
 
+### 💻 Running on PC & Simulation Modes
+
+DoorLink can be executed directly on a PC for testing, UI evaluation, and development using three simulation environments:
+
+1. **Chrome Web Browser (Web Simulation)**:
+   ```bash
+   cd doorlink_app
+   flutter run -d chrome
+   ```
+
+2. **Linux Desktop (Native PC Build)**:
+   ```bash
+   cd doorlink_app
+   flutter run -d linux
+   ```
+
+3. **Android Emulator (Full Native & BLE Service Simulation)**:
+   ```bash
+   # Launch available Android emulator
+   flutter emulators --launch Medium_Phone_API_35
+
+   # Run the app
+   cd doorlink_app
+   flutter run
+   ```
+
 ### Background Beacon Service (`BeaconService.kt`)
 The heart of the mobile app is a native foreground service that runs continuously.
 * **Low-Latency Scanning:** It constantly scans for the ESP32's specific Manufacturer Data (`0x0144`) containing the rotating challenge.

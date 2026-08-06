@@ -1,17 +1,43 @@
-# doorlink
+# DoorLink Mobile Companion App
 
-A new Flutter project.
+DoorLink is a secure, offline-first smart access control application built with Flutter.
 
-## Getting Started
+## 🚀 Running on PC & Simulation Modes
 
-This project is a starting point for a Flutter application.
+You can launch and test the application on PC using any of the following commands:
 
-A few resources to get you started if this is your first Flutter project:
+### 1. Chrome Web Browser (Web Simulation)
+Runs the app instantly in Google Chrome:
+```bash
+flutter run -d chrome
+```
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+### 2. Linux Desktop (Native PC App)
+Compiles and launches as a native Linux desktop application:
+```bash
+flutter run -d linux
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+### 3. Android Emulator (Full Native & BLE Service Simulation)
+Launch an Android virtual device and run the full native application:
+```bash
+# Launch Android emulator
+flutter emulators --launch Medium_Phone_API_35
+
+# Run application
+flutter run
+```
+
+## 📱 Hardware / Physical Android Device
+
+Connect an Android smartphone via USB with USB Debugging enabled, then execute:
+```bash
+flutter run
+```
+
+## 🛠️ Diagnostics & Code Quality
+
+Run static analysis across Dart code:
+```bash
+flutter analyze
+```
