@@ -51,6 +51,164 @@ When the lock receives the broadcast, it runs the `compute_expected_response()` 
 
 ---
 
+## 🛠️ Setting Up the Build Environment From Scratch
+
+Follow these instructions to set up a complete development environment from a fresh, empty Ubuntu installation (Ubuntu 22.04 LTS or 24.04 LTS recommended) for both the ESP32 firmware and the mobile/desktop app.
+
+### 0. System Prerequisites & Serial Permissions (Fresh Ubuntu Setup)
+
+Before installing toolchains, configure user permissions for USB serial hardware (ESP32) and Android emulator virtualization:
+
+```bash
+# Add current user to dialout (for UART/serial access) and kvm (for Android emulator)
+sudo usermod -a -G dialout,kvm $USER
+
+# Remove brltty daemon if installed (prevents USB-Serial port conflicts on Ubuntu)
+sudo apt remove -y brltty
+
+# Re-login or reboot for group permissions to take effect:
+# (Or run 'newgrp dialout' in your active terminal)
+```
+
+---
+
+### 1. ESP32 Firmware Environment Setup (`doorlink_device`)
+
+The firmware relies on **ESP-IDF (Espressif IoT Development Framework)** v5.x with CMake and GCC/Clang toolchains for RISC-V (`esp32c3`).
+
+#### Step 1: Install System Dependencies (Ubuntu / Debian)
+```bash
+sudo apt update
+sudo apt install -y git wget flex bison gperf python3 python3-pip python3-venv \
+    cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0-dev
+```
+
+#### Step 2: Install ESP-IDF Toolchain
+```bash
+mkdir -p ~/esp
+cd ~/esp
+git clone -b v5.1.2 --recursive https://github.com/espressif/esp-idf.git
+cd ~/esp/esp-idf
+./install.sh esp32c3
+```
+
+#### Step 3: Export ESP-IDF Environment Variables
+Add ESP-IDF to your shell configuration (`~/.bashrc`) so `idf.py` is always available in new terminal sessions:
+```bash
+echo '. $HOME/esp/esp-idf/export.sh' >> ~/.bashrc
+source ~/.bashrc
+```
+
+#### Step 4: CLI Build & Flash (Terminal Workflow)
+```bash
+# Navigate to root or doorlink_device folder
+cd doorlink_device
+
+# Set target microcontroller to ESP32-C3
+idf.py set-target esp32c3
+
+# Compile the firmware
+idf.py build
+
+# Flash to connected ESP32-C3 board and launch serial console monitor
+idf.py -p /dev/ttyUSB0 flash monitor
+```
+
+#### Step 5: Visual Studio Code Setup (IDE Workflow)
+
+For developing, building, flashing, and monitoring UART logs directly inside VS Code:
+
+1. **Install Recommended VS Code Extensions**:
+   - **ESP-IDF Extension** (`espressif.esp-idf-extension`): Building, flashing, partition management, and serial output monitoring.
+   - **C/C++ Tools** (`ms-vscode.cpptools`): IntelliSense, code navigation, and syntax highlighting.
+   - **CMake Tools** (`ms-vscode.cmake-tools`): CMake project support.
+   *(Opening `doorlink_device` in VS Code will prompt you to install these via [.vscode/extensions.json](file:///home/olgun/CODE/doorlink/doorlink_device/.vscode/extensions.json)).*
+
+2. **Link Existing ESP-IDF Setup**:
+   - Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`).
+   - Search for **ESP-IDF: Configure ESP-IDF Extension**.
+   - Select **Use Existing Setup** and point it to your ESP-IDF directory (`~/esp/esp-idf`) and Python virtual environment (`~/.espressif/python_env/...`).
+
+3. **Building, Flashing & Monitoring via VS Code Status Bar**:
+   - **Set Target Device**: Click target icon in status bar (or run `ESP-IDF: Set Espressif Device Target`) and select `esp32c3`.
+   - **Select Serial Port**: Click port icon in status bar (or run `ESP-IDF: Select Port to Use`) and select your serial port (`/dev/ttyUSB0` or `/dev/ttyACM0`).
+   - **Build**: Click the Cylinder icon ⚙️ (or press `Ctrl+E B` / `ESP-IDF: Build Project`).
+   - **Flash**: Click the Lightning icon ⚡ (or press `Ctrl+E F` / `ESP-IDF: Flash Device`).
+   - **Monitor UART Logs**: Click the Monitor icon 🖥️ (or press `Ctrl+E M` / `ESP-IDF: Monitor Device`).
+   - **All-in-One Shortcut**: Click **Build, Flash and Start Monitor** on the bottom status bar for 1-click execution.
+
+---
+
+### 2. Mobile & Desktop App Environment Setup (`doorlink_app`)
+
+The companion app is built using **Flutter** (Dart SDK `^3.0.0`) with native **Android (Kotlin, Java 17)** support for the background BLE service, as well as **Linux Desktop** and **Web (Chrome)** target environments.
+
+#### Step 1: Install Java Development Kit (JDK 17)
+```bash
+sudo apt install -y openjdk-17-jdk
+echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64' >> ~/.bashrc
+source ~/.bashrc
+```
+
+#### Step 2: Install Flutter SDK
+```bash
+# Clone Flutter SDK (stable channel)
+cd ~
+git clone https://github.com/flutter/flutter.git -b stable
+
+# Add Flutter binary to PATH persistently
+echo 'export PATH="$PATH:$HOME/flutter/bin"' >> ~/.bashrc
+source ~/.bashrc
+
+# Pre-download development tools & binaries
+flutter doctor
+```
+
+#### Step 3: Install Android Studio & SDK Components
+1. Download and install [Android Studio](https://developer.android.com/studio).
+2. Open Android Studio -> **SDK Manager** -> **SDK Tools**, and verify installation of:
+   - **Android SDK Build-Tools**
+   - **Android SDK Command-line Tools**
+   - **Android SDK Platform-Tools**
+   - **NDK (Side by side)**
+3. Accept Android licenses:
+   ```bash
+   flutter doctor --android-licenses
+   ```
+
+#### Step 4: Install Linux Desktop Build Dependencies (Optional for Desktop Debugging)
+```bash
+sudo apt install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+```
+
+#### Step 5: Fetch Dependencies & Verify Setup
+```bash
+cd doorlink_app
+
+# Fetch Dart/Flutter package dependencies
+flutter pub get
+
+# Run Flutter doctor to verify full toolchain setup
+flutter doctor
+```
+
+#### Step 6: Build & Launch
+```bash
+# Run on connected Android smartphone or running emulator:
+flutter run
+
+# Run on Linux Desktop:
+flutter run -d linux
+
+# Run on Chrome Browser (Web Simulation):
+flutter run -d chrome
+
+# Build production Android release APK:
+flutter build apk --release
+```
+
+---
+
 ## 📱 Mobile App (Flutter / Android)
 
 ### 💻 Running on PC & Simulation Modes
