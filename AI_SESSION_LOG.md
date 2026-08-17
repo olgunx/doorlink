@@ -3,7 +3,7 @@
 **Session Timestamp:** 2024-05-24 16:00 UTC (Zero-Friction UX & BLE Pairing)
 
 ## 🗺️ Project Overview & Code Map
-DoorLink is a highly secure, zero-interaction smart lock. It combines a background BLE challenge-response mechanism (HMAC-SHA256 over ECDH shared secrets) with physical intent verification (VL6180X Time-of-Flight laser sensor).
+DoorLink is a highly secure, zero-interaction smart lock. It combines a background BLE challenge-response mechanism (HMAC-SHA256 over ECDH shared secrets) with physical intent verification (VL53L0X Time-of-Flight laser sensor).
 
 ### 📱 Mobile App (`doorlink_app/`)
 *   **`lib/main.dart`**: The Flutter UI. Handles BLE GATT connections for pairing (`_fetchPubKeyViaBle`) and admin sync (`_syncUserViaBle`). Parses native OS share intents (e.g., WhatsApp) to onboard new users.
@@ -12,7 +12,7 @@ DoorLink is a highly secure, zero-interaction smart lock. It combines a backgrou
 *   **`android/build.gradle.kts`**: Contains critical JVM target alignments (Java 17 / Kotlin 17) to prevent Flutter plugin compilation errors.
 
 ### ⚙️ ESP32 Firmware (`doorlink_device/`)
-*   **`main/app_main.c`**: Core FreeRTOS state machine. Manages the VL6180X laser sensor, processes the crypto authentication queue (`auth_task`), and triggers the physical door relay (`relay_task`).
+*   **`main/app_main.c`**: Core FreeRTOS state machine. Manages the VL53L0X laser sensor, processes the crypto authentication queue (`auth_task`), and triggers the physical door relay (`relay_task`).
 *   **`main/ble_scanner.c`**: Handles all NimBLE radio operations. Broadcasts rotating BLE challenges, scans for smartphone HMAC responses, and hosts the connectable Admin GATT Server (`0xFCD4`) for zero-friction provisioning and Chip ID extraction.
 *   **`main/enrollment_mgr.c`**: Manages NVS (Non-Volatile Storage). Securely saves, updates, and revokes resident Public Keys and User IDs.
 *   **`main/device_key.c`**: Handles the ESP32's internal P-256 Elliptic Curve key pair generation and mbedTLS operations.

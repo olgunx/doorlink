@@ -6,6 +6,7 @@ idf_component_register(
         "device_tracker.c"
         "enrollment_mgr.c"
         "proximity_engine.c"
+        "vl53l0x.c"
         "vl6180x.c"
         "web_console.c"
     INCLUDE_DIRS "."

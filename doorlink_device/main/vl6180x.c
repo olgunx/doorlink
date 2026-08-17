@@ -1,4 +1,4 @@
-// Minimal VL6180X driver, ported from olgunx/doorlock.
+// Minimal VL6180X driver for ESP-IDF.
 #include "vl6180x.h"
 
 #include "driver/i2c.h"

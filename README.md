@@ -98,7 +98,7 @@ If the user wants to unlock the door without triggering the physical laser senso
 Opening the door requires three conditions to be met simultaneously:
 1. **Authorized (`s_authorized`):** The cryptographic HMAC response must match the expected value computed by the ESP32.
 2. **Arrived (`s_arrived`):** The RSSI (signal strength) of the phone's BLE response must be stronger than a defined threshold (e.g., `-127` dBm, configurable), ensuring the user is physically near the door.
-3. **Intent / Laser Detected (`s_laser_detected`):** A VL6180X Time-of-Flight laser sensor continuously polls distance. The user must wave their hand in front of the sensor (distance > 0 && distance <= threshold). This ensures the door doesn't pop open just because someone walked past the inside of the door with their phone in their pocket.
+3. **Intent / Laser Detected (`s_laser_detected`):** A VL53L0X Time-of-Flight laser sensor continuously polls distance. The user must wave their hand in front of the sensor (distance > 0 && distance <= threshold). This ensures the door doesn't pop open just because someone walked past the inside of the door with their phone in their pocket.
    * *Override:* If the `Manual Unlock` button was pressed via the app, this laser requirement is bypassed for a 5-second window.
 
 ### 3. Web Administration Console (`web_console.c`)
@@ -133,7 +133,7 @@ To transition DoorLink from a functional prototype into a mass-market, multi-ten
 ### 🛠️ Hardware & Industrial Design Changes
 - [ ] **Split-Module Enclosure Design:**
   - **Main Controller Box:** House the ESP32, relay circuitry, and power terminal inside a secure, indoor-rated box installed safely inside the building lobby. It will only require a standard 12V DC adapter power entry.
-  - **External Sensor Block:** Create a tiny, ruggedized, weatherproof (IP65+) outdoor pod containing only the VL6180X Time-of-Flight sensor.
+  - **External Sensor Block:** Create a tiny, ruggedized, weatherproof (IP65+) outdoor pod containing only the VL53L0X Time-of-Flight sensor.
   - **Inter-Module Wiring:** Connect the main box and the outdoor sensor block via a robust, vandal-resistant 4-pin cable.
 - [ ] **Intercom (Diyafon) Parallel Integration:** Design the dry-contact relay output terminal to wire directly in parallel with existing building intercom systems (Audio, Netelsan, Mas, etc.) to trigger the 12V door strike (*kapı otomatiği*) without interfering with indoor flat-to-door buzzer pulses.
 

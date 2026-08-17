@@ -2,6 +2,7 @@
 #include "config.h"
 #include "device_key.h"
 #include "proximity_engine.h"
+#include "vl53l0x.h"
 #include "vl6180x.h"
 #include "enrollment_mgr.h"
 
@@ -365,22 +366,40 @@ static void token_rotate_task(void *arg)
     }
 }
 
-static esp_err_t init_vl6180x_bus(void)
+static esp_err_t init_sensor_device(void)
+{
+#if CONFIG_SENSOR_TYPE == SENSOR_TYPE_VL53L0X
+    return vl53l0x_init(SENSOR_I2C_PORT);
+#else
+    return vl6180x_init(SENSOR_I2C_PORT);
+#endif
+}
+
+static esp_err_t read_sensor_range_mm(uint16_t *out_mm)
+{
+#if CONFIG_SENSOR_TYPE == SENSOR_TYPE_VL53L0X
+    return vl53l0x_read_range_mm(SENSOR_I2C_PORT, out_mm);
+#else
+    return vl6180x_read_range_mm(SENSOR_I2C_PORT, out_mm);
+#endif
+}
+
+static esp_err_t init_sensor_bus(void)
 {
     i2c_config_t i2c_conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = VL6180X_I2C_SDA_GPIO,
-        .scl_io_num = VL6180X_I2C_SCL_GPIO,
+        .sda_io_num = SENSOR_I2C_SDA_GPIO,
+        .scl_io_num = SENSOR_I2C_SCL_GPIO,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = VL6180X_I2C_CLK_SPEED_HZ,
+        .master.clk_speed = SENSOR_I2C_CLK_SPEED_HZ,
     };
-    ESP_RETURN_ON_ERROR(i2c_param_config(VL6180X_I2C_PORT, &i2c_conf), TAG, "i2c_param_config");
-    esp_err_t err = i2c_driver_install(VL6180X_I2C_PORT, i2c_conf.mode, 0, 0, 0);
+    ESP_RETURN_ON_ERROR(i2c_param_config(SENSOR_I2C_PORT, &i2c_conf), TAG, "i2c_param_config");
+    esp_err_t err = i2c_driver_install(SENSOR_I2C_PORT, i2c_conf.mode, 0, 0, 0);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
     }
-    return vl6180x_init(VL6180X_I2C_PORT);
+    return init_sensor_device();
 }
 
 static void sensor_task(void *arg)
@@ -388,20 +407,35 @@ static void sensor_task(void *arg)
     (void)arg;
     while (true) {
         if (g_hw_failure) {
-            // Attempt to re-initialize if it was previously failed (e.g. hot-plugged)
-            if (vl6180x_init(VL6180X_I2C_PORT) == ESP_OK) {
+            // Attempt to re-initialize if it was previously failed
+            esp_err_t init_err = init_sensor_device();
+            if (init_err == ESP_OK) {
                 g_hw_failure = false;
                 ESP_LOGI(TAG, "Laser sensor recovered and initialized!");
+            } else {
+                ESP_LOGW(TAG, "Laser sensor re-init attempt failed: %s", esp_err_to_name(init_err));
             }
         }
 
         uint16_t distance_mm = 0;
-        if (!g_hw_failure && vl6180x_read_range_mm(VL6180X_I2C_PORT, &distance_mm) == ESP_OK) {
-            s_laser_detected = distance_mm > 0 && distance_mm <= VL6180X_PRESENCE_THRESHOLD_MM;
+        esp_err_t measurement_err = g_hw_failure
+                                        ? ESP_ERR_INVALID_STATE
+                                        : read_sensor_range_mm(&distance_mm);
+        if (measurement_err == ESP_OK) {
+            bool in_range = (distance_mm >= 30 && distance_mm <= SENSOR_PRESENCE_THRESHOLD_MM);
+            s_laser_detected = in_range;
             g_hw_failure = false;
+            if (distance_mm == 0xFFFF) {
+                ESP_LOGI(TAG, "Laser distance: Out of range (detected: 0)");
+            } else {
+                ESP_LOGI(TAG, "Laser distance: %u mm (detected: %d)", distance_mm, s_laser_detected);
+            }
         } else {
             s_laser_detected = false;
-            g_hw_failure = true;
+            if (measurement_err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "Laser read error: %s", esp_err_to_name(measurement_err));
+            }
+            g_hw_failure = (measurement_err != ESP_ERR_TIMEOUT && measurement_err != ESP_OK);
         }
 
         bool manual_trigger = g_manual_unlock_until_ms && (int32_t)(g_manual_unlock_until_ms - now_ms()) > 0;
@@ -423,7 +457,7 @@ static void sensor_task(void *arg)
             format_uptime(ts, sizeof(ts), now_ms());
             ESP_LOGI(TAG, "[%s] challenge burned; waiting for new claim", ts);
         }
-        vTaskDelay(pdMS_TO_TICKS(VL6180X_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_MS));
     }
 }
 
@@ -579,7 +613,7 @@ void app_main(void)
     set_relay(false); // Set logical level HIGH (secure) BEFORE enabling output
     gpio_set_direction(RELAY_GPIO, GPIO_MODE_OUTPUT);
 
-    esp_err_t sensor_err = init_vl6180x_bus();
+    esp_err_t sensor_err = init_sensor_bus();
     if (sensor_err != ESP_OK) {
         ESP_LOGW(TAG, "Laser sensor not detected: %s. Continuing without hardware sensor.", esp_err_to_name(sensor_err));
         g_hw_failure = true;
