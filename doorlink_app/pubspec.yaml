@@ -11,7 +11,7 @@ dependencies:
   flutter:
     sdk: flutter
   # Dependency for native OS Share Sheet integration
-  share_plus: ^13.1.0 
+  share_plus: ^10.0.0 
   permission_handler: ^11.3.1
   receive_sharing_intent: ^1.8.1
   flutter_blue_plus: ^1.32.0

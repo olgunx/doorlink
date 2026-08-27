@@ -12,6 +12,9 @@
 #include "device_key.h"
 #include "cJSON.h"
 #include "nvs.h"
+#include "esp_ota_ops.h"
+#include "esp_flash_partitions.h"
+#include "esp_system.h"
 
 static const char *TAG = "web_console";
 static httpd_handle_t s_server = NULL;
@@ -186,7 +189,21 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         }
     }
     
-    snprintf(html + offset, 4096 - offset, "</ul></body></html>");
+    snprintf(html + offset, 4096 - offset, "</ul><hr><h3>Firmware Update (OTA)</h3>"
+                       "<input type='file' id='fw_file' accept='.bin'>"
+                       "<button onclick='uploadOTA()'>Upload & Flash</button>"
+                       "<p id='ota_status'></p>"
+                       "<script>"
+                       "function uploadOTA() {"
+                       "  var f = document.getElementById('fw_file').files[0];"
+                       "  if(!f) return alert('Select file!');"
+                       "  var s = document.getElementById('ota_status'); s.innerText = 'Uploading...';"
+                       "  fetch('/api/ota', {method: 'POST', body: f})"
+                       "  .then(r => r.text()).then(t => { s.innerText = t; if(t.includes('successful')) setTimeout(()=>location.reload(), 3000); })"
+                       "  .catch(e => s.innerText = 'Error: ' + e);"
+                       "}"
+                       "</script>"
+                       "</body></html>");
                        
     httpd_resp_set_type(req, "text/html");
     esp_err_t ret = httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -348,6 +365,74 @@ static httpd_uri_t api_revoke_post = { .uri = "/api/revoke", .method = HTTP_POST
 static httpd_uri_t api_unlock_post = { .uri = "/api/unlock", .method = HTTP_POST, .handler = api_unlock_post_handler };
 static httpd_uri_t api_pubkey_get = { .uri = "/api/pubkey", .method = HTTP_GET, .handler = api_pubkey_get_handler };
 
+static esp_err_t api_ota_post_handler(httpd_req_t *req)
+{
+    if (!is_authenticated(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t update_handle = 0;
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "No OTA partition found");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char buf[1024];
+    int received;
+    int remaining = req->content_len;
+
+    while (remaining > 0) {
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)))) <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            esp_ota_abort(update_handle);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(update_handle, (const void *)buf, received);
+        if (err != ESP_OK) {
+            esp_ota_abort(update_handle);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        remaining -= received;
+    }
+
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed!");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed!");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_sendstr(req, "Update successful! Rebooting in 2s...");
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    esp_restart();
+    return ESP_OK;
+}
+
+static httpd_uri_t api_ota_post = { .uri = "/api/ota", .method = HTTP_POST, .handler = api_ota_post_handler };
+
 esp_err_t web_console_init(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -363,6 +448,7 @@ esp_err_t web_console_init(void)
         httpd_register_uri_handler(s_server, &api_revoke_post);
         httpd_register_uri_handler(s_server, &api_unlock_post);
         httpd_register_uri_handler(s_server, &api_pubkey_get);
+        httpd_register_uri_handler(s_server, &api_ota_post);
         return ESP_OK;
     }
     

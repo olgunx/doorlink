@@ -88,6 +88,26 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
+                "enableAdminAp" -> {
+                    val userId = call.argument<String>("userId")?.trim().orEmpty()
+                    val espPubKey = call.argument<String>("espPubKey")?.trim().orEmpty()
+                    if (userId.isBlank() || espPubKey.isBlank()) {
+                        result.error("ERR_BAD_ARGS", "Missing credentials", null)
+                        return@setMethodCallHandler
+                    }
+
+                    val intent = Intent(this, BeaconService::class.java).apply {
+                        putExtra(BeaconService.EXTRA_USER_ID, "AP_ENABLE_$userId")
+                        putExtra(BeaconService.EXTRA_ESP_PUB_KEY, espPubKey)
+                    }
+                    try {
+                        ContextCompat.startForegroundService(this, intent)
+                        result.success("OK")
+                    } catch (e: Exception) {
+                        result.error("ERR_START_SERVICE", e.message, null)
+                    }
+                }
+
                 "stopBackgroundService" -> {
                     val intent = Intent(this, BeaconService::class.java).apply {
                         action = BeaconService.ACTION_STOP

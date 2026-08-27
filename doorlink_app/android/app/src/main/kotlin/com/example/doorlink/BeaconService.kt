@@ -132,6 +132,9 @@ class BeaconService : Service() {
         if (userIdHex.startsWith("MANUAL_")) {
             currentServiceUuid = "0000fcd3-0000-1000-8000-00805f9b34fb"
             userIdHex = userIdHex.substring(7)
+        } else if (userIdHex.startsWith("AP_ENABLE_")) {
+            currentServiceUuid = "0000fcd4-0000-1000-8000-00805f9b34fb"
+            userIdHex = userIdHex.substring(10)
         } else {
             currentServiceUuid = "0000fcd2-0000-1000-8000-00805f9b34fb"
         }

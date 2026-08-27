@@ -21,4 +21,6 @@ idf_component_register(
         nvs_flash
         json
         mbedtls
+        app_update
+        spi_flash
 )

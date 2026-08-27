@@ -384,6 +384,27 @@ class _MainAppScreenState extends State<MainAppScreen> {
     }
   }
 
+  Future<void> _enableAdminAp() async {
+    _addLog('Enable Admin AP requested...');
+    
+    try {
+      await platform.invokeMethod('enableAdminAp', {
+        'userId': _userId,
+        'espPubKey': _espPublicKey,
+      });
+      Future.delayed(const Duration(seconds: 5), () {
+        if (_isActive && mounted) {
+          platform.invokeMethod('startBackgroundService', {
+            'userId': _userId,
+            'espPubKey': _espPublicKey,
+          });
+        }
+      });
+    } catch (e) {
+      _addLog('Failed to trigger AP: $e');
+    }
+  }
+
   Future<int> _getAndroidSdkInt() async {
     if (!Platform.isAndroid) return 0;
     try {
@@ -669,9 +690,109 @@ class _MainAppScreenState extends State<MainAppScreen> {
               child: Text('Manual Unlock', style: TextStyle(fontSize: 18)),
             ),
           ),
+          const SizedBox(height: 20),
+          ElevatedButton.icon(
+            onPressed: _isActive ? _enableAdminAp : null,
+            icon: const Icon(Icons.wifi_tethering),
+            label: const Padding(
+              padding: EdgeInsets.all(12.0),
+              child: Text('Enable Admin AP (1 Hour)', style: TextStyle(fontSize: 18)),
+            ),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey),
+          ),
+          const SizedBox(height: 20),
+          ElevatedButton.icon(
+            onPressed: _isActive ? _checkDeviceStatusViaBle : null,
+            icon: const Icon(Icons.info_outline),
+            label: const Padding(
+              padding: EdgeInsets.all(12.0),
+              child: Text('Check AP Status', style: TextStyle(fontSize: 18)),
+            ),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.teal),
+          ),
         ],
       ),
     );
+  }
+
+  Future<void> _checkDeviceStatusViaBle() async {
+    setState(() => _status = 'Checking AP Status...');
+    _addLog('Checking device status via BLE...');
+
+    bool wasActive = _isActive;
+    if (wasActive) {
+      await _stopListening();
+      await Future.delayed(const Duration(milliseconds: 1500));
+    }
+
+    try {
+      final targetDevice = await _scanAndConnectToLock();
+      
+      _addLog('Discovering services for status check...');
+      final services = await targetDevice.discoverServices();
+      BluetoothService? adminSvc;
+      for (var s in services) {
+        if (s.uuid.toString().toUpperCase() == '0000FCD4-0000-1000-8000-00805F9B34FB') {
+          adminSvc = s;
+          break;
+        }
+      }
+
+      if (adminSvc == null) {
+        throw Exception('Admin Service (0xFCD4) not found.');
+      }
+
+      BluetoothCharacteristic? statusChr;
+      for (var c in adminSvc.characteristics) {
+        if (c.uuid.toString().toUpperCase() == '0000FCDA-0000-1000-8000-00805F9B34FB') {
+          statusChr = c;
+          break;
+        }
+      }
+
+      if (statusChr == null) {
+        throw Exception('Status Characteristic (0xFCDA) not found.');
+      }
+
+      _addLog('Reading status characteristic...');
+      final value = await statusChr.read();
+      if (value.length >= 4) {
+        final apStatus = value[3] == 1 ? 'ON (Enabled)' : 'OFF (Disabled)';
+        _addLog('AP Status retrieved: $apStatus');
+        
+        if (mounted) {
+          showDialog(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('Device Status'),
+              content: Text('The Admin Access Point is currently:\n\n$apStatus', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
+          );
+        }
+      } else {
+        throw Exception('Status payload too small: ${value.length} bytes. Update device firmware.');
+      }
+
+      await targetDevice.disconnect();
+    } catch (e) {
+      _addLog('Status check failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to read status: $e')),
+        );
+      }
+    } finally {
+      if (wasActive && mounted) {
+        _initListening();
+      }
+      setState(() => _status = 'Idle');
+    }
   }
 
   Future<void> _syncUserViaBle(String userIdHex, String pubKeyHex) async {
@@ -1039,10 +1160,8 @@ class _MainAppScreenState extends State<MainAppScreen> {
             child: ElevatedButton.icon(
             onPressed: () {
               if (_userId.isNotEmpty && _appPublicKey.isNotEmpty) {
-                SharePlus.instance.share(
-                  ShareParams(
-                    text: 'Hello Admin, here is my DoorLink provisioning data to grant me access:\n\nFingerprint (User ID): $_userId\nApp Public Key (raw hex): $_appPublicKey',
-                  ),
+                Share.share(
+                  'Hello Admin, here is my DoorLink provisioning data to grant me access:\n\nFingerprint (User ID): $_userId\nApp Public Key (raw hex): $_appPublicKey'
                 );
               }
             },

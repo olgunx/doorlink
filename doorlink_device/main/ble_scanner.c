@@ -15,6 +15,9 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "esp_mac.h"
 
+extern void trigger_manual_unlock(void);
+extern void trigger_enable_ap(void);
+
 static const char *TAG = "ble_scanner";
 static uint8_t s_own_addr_type;
 
@@ -105,7 +108,7 @@ static int admin_status_read_access(uint16_t conn_handle, uint16_t attr_handle,
                                     struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        uint8_t buf[3] = {0};
+        uint8_t buf[4] = {0};
         get_system_status_bytes(buf);
         int rc = os_mbuf_append(ctxt->om, buf, sizeof(buf));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -263,6 +266,8 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg)
                 for (int i = 0; i < fields.num_uuids16; i++) {
                     if (fields.uuids16[i].value == 0xFCD3) {
                         trigger_manual_unlock();
+                    } else if (fields.uuids16[i].value == 0xFCD4) {
+                        trigger_enable_ap();
                     }
                 }
             }
@@ -271,9 +276,15 @@ static int ble_gap_cb(struct ble_gap_event *event, void *arg)
                     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
                     0x00, 0x10, 0x00, 0x00, 0xd3, 0xfc, 0x00, 0x00
                 };
+                static const uint8_t ap_uuid128[16] = {
+                    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                    0x00, 0x10, 0x00, 0x00, 0xd4, 0xfc, 0x00, 0x00
+                };
                 for (int i = 0; i < fields.num_uuids128; i++) {
                     if (memcmp(fields.uuids128[i].value, manual_uuid128, 16) == 0) {
                         trigger_manual_unlock();
+                    } else if (memcmp(fields.uuids128[i].value, ap_uuid128, 16) == 0) {
+                        trigger_enable_ap();
                     }
                 }
             }

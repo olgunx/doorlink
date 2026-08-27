@@ -6,6 +6,10 @@
 #include "vl6180x.h"
 #include "enrollment_mgr.h"
 
+#include "esp_wifi.h"
+#include "esp_mac.h"
+#include "esp_event.h"
+#include "web_console.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_check.h"
@@ -64,6 +68,64 @@ static QueueHandle_t s_claim_queue = NULL;
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
 
 volatile uint32_t g_manual_unlock_until_ms = 0;
+volatile uint32_t g_ap_enabled_until_ms = 0;
+static bool s_ap_is_running = false;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d", MAC2STR(event->mac), event->aid);
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d", MAC2STR(event->mac), event->aid);
+    }
+}
+
+void trigger_enable_ap(void) {
+    if (s_ap_is_running) {
+        g_ap_enabled_until_ms = now_ms() + 3600000;
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Starting Admin AP (DL_DOOR)");
+    
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = "DL_DOOR",
+            .ssid_len = strlen("DL_DOOR"),
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN,
+            .ssid_hidden = 0,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    web_console_init();
+    
+    s_ap_is_running = true;
+    g_ap_enabled_until_ms = now_ms() + 3600000;
+}
 
 void trigger_manual_unlock(void) {
     g_manual_unlock_until_ms = now_ms() + 5000;
@@ -97,10 +159,11 @@ static void set_relay(bool on) { gpio_set_level(RELAY_GPIO, RELAY_ACTIVE_LOW ? !
 
 void get_system_status_bytes(uint8_t *out_buf) {
     if (!out_buf) return;
-    // Byte 0: Relay Status, Byte 1: Laser Status, Byte 2: Auth Window Active
+    // Byte 0: Relay Status, Byte 1: Laser Status, Byte 2: Auth Window Active, Byte 3: AP Status
     out_buf[0] = (s_relay_active_until_ms && (int32_t)(s_relay_active_until_ms - now_ms()) > 0) ? 1 : 0;
     out_buf[1] = s_laser_detected ? 1 : 0;
     out_buf[2] = s_authorized ? 1 : 0;
+    out_buf[3] = s_ap_is_running ? 1 : 0;
 }
 
 static void update_stealth_token(void)
@@ -325,6 +388,11 @@ static void status_task(void *arg)
             s_authorized = false; // Drop auth if we haven't received a valid cryptogram recently
         }
 
+        if (s_ap_is_running && now > g_ap_enabled_until_ms) {
+            ESP_LOGI(TAG, "AP timer expired. Rebooting to secure state.");
+            esp_restart();
+        }
+
         const bool comm = s_last_claim_ms != 0 && last_claim_age_ms <= CLAIM_IDLE_TIMEOUT_MS;
         const bool auth = s_authorized;
         const bool arrived = s_arrived;
@@ -426,7 +494,7 @@ static void sensor_task(void *arg)
             s_laser_detected = in_range;
             g_hw_failure = false;
             if (distance_mm == 0xFFFF) {
-                ESP_LOGI(TAG, "Laser distance: Out of range (detected: 0)");
+//                ESP_LOGI(TAG, "Laser distance: Out of range (detected: 0)");
             } else {
                 ESP_LOGI(TAG, "Laser distance: %u mm (detected: %d)", distance_mm, s_laser_detected);
             }
@@ -492,6 +560,22 @@ static void relay_task(void *arg)
                 red_led_state = !red_led_state;
                 gpio_set_level(RED_LED_GPIO, red_led_state ? 0 : 1);
                 gpio_set_level(GREEN_LED_GPIO, red_led_state ? 0 : 1);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        
+        // Admin AP Mode takes second priority — blink ALIVE and DETECTION LEDs alternately
+        if (s_ap_is_running) {
+            green_blink_counter++;
+            if (green_blink_counter >= 25) { // Toggle every 500ms (25 * 20ms)
+                green_blink_counter = 0;
+                green_led_state = !green_led_state;
+                gpio_set_level(ALIVE_LED_GPIO, green_led_state ? 1 : 0);
+                gpio_set_level(DETECTION_LED_GPIO, green_led_state ? 0 : 1);
+                
+                gpio_set_level(RED_LED_GPIO, 1); // Ensure OFF
+                gpio_set_level(GREEN_LED_GPIO, 1); // Ensure OFF
             }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
