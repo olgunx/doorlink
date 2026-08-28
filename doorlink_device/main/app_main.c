@@ -61,6 +61,7 @@ static bool s_enrolled_pubkey_logged;
 static bool s_device_pubkey_logged = false;
 static volatile bool g_hw_failure = false;
 static volatile bool g_sw_failure = false;
+static volatile bool s_waiting_for_laser_clear = false;
 
 static nvs_handle_t s_nvs = 0;
 static QueueHandle_t s_claim_queue = NULL;
@@ -492,6 +493,9 @@ static void sensor_task(void *arg)
         if (measurement_err == ESP_OK) {
             bool in_range = (distance_mm >= 30 && distance_mm <= SENSOR_PRESENCE_THRESHOLD_MM);
             s_laser_detected = in_range;
+            if (!s_laser_detected) {
+                s_waiting_for_laser_clear = false;
+            }
             g_hw_failure = false;
             if (distance_mm == 0xFFFF) {
 //                ESP_LOGI(TAG, "Laser distance: Out of range (detected: 0)");
@@ -508,8 +512,11 @@ static void sensor_task(void *arg)
 
         bool manual_trigger = g_manual_unlock_until_ms && (int32_t)(g_manual_unlock_until_ms - now_ms()) > 0;
 
-        if (s_authorized && s_arrived && (s_laser_detected || manual_trigger)) {
+        if (s_authorized && s_arrived && ((s_laser_detected && !s_waiting_for_laser_clear) || manual_trigger)) {
             s_relay_active_until_ms = now_ms() + RELAY_TRIGGER_MS;
+            if (s_laser_detected) {
+                s_waiting_for_laser_clear = true;
+            }
 
             update_stealth_token(); // Roll immediately
             g_manual_unlock_until_ms = 0;
