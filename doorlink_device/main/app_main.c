@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_app_desc.h"
 
 #include "mbedtls/md.h"
 #include "mbedtls/ecdh.h"
@@ -652,6 +653,14 @@ static void relay_task(void *arg)
 
 void app_main(void)
 {
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    ESP_LOGI(TAG, "==========================================");
+    ESP_LOGI(TAG, "Booting DoorLink Device Firmware");
+    ESP_LOGI(TAG, "Build Date: %s", app_desc->date);
+    ESP_LOGI(TAG, "Build Time: %s", app_desc->time);
+    ESP_LOGI(TAG, "Git Commit/Version: %s", app_desc->version);
+    ESP_LOGI(TAG, "==========================================");
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ret = nvs_flash_erase();
